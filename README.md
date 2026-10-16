@@ -8,21 +8,23 @@ This speaks Notion's internal web client API, not the public integration API.
 It is unofficial and can break when Notion changes its client. Development
 follows [issue #118](https://github.com/magpie-community/plugins/issues/118).
 
-Status: development build, version 0.1.0. Its core protocol was captured from a
+Status: development build, version 0.2.0. Its core protocol was captured from a
 consenting account on 2026-10-16: model listing, new-thread creation, a
 streamed answer and a second turn worked in Notion's browser client. A
 browser-compatible bundle of these exact provider modules then listed 29
 available models and completed an SSE first turn and a buffered JSON
 continuation through Haiku 5.5. The two unit suites, the offline hook check and
-that bundle pass. Native Magpie/OpenCode installation and their auth-store
-behavior still require a runtime acceptance test by a user with an account.
+that bundle pass, and the browser sign-in below was read live on a machine whose
+Chrome was already signed in, without stating a workspace id. Native
+Magpie/OpenCode installation and their auth-store behavior still require a
+runtime acceptance test by a user with an account.
 
 ## Install
 
 From git, or from a folder you cloned:
 
 ```sh
-magpie plugin add https://github.com/resucdueff/magpie_notion
+magpie plugin add https://github.com/resucdueff/magpie-notion
 magpie plugin login notion
 ```
 
@@ -40,11 +42,36 @@ on `magpie plugin add opencode-notion-auth` works too.
 
 ## Sign-in
 
-The auth method asks for the complete Cookie request header from the user's own
-Notion web session, workspace UUID (`spaceId`) and optional active-user UUID
-when the browser session contains multiple Notion identities. A public Notion
-integration key does not grant access to Notion AI. Sessions can expire; there
-is no automatic login, cookie extraction or renewal in this package.
+Two methods are offered, and neither asks for a workspace UUID:
+
+- **Use the Notion session in this browser** (the default). The plugin reads the
+  session out of the browser this machine is already signed in to: Chrome, Edge,
+  Brave, Chromium or Firefox, on Windows, macOS and Linux, in that order. The
+  store is copied before it is opened, so a running browser is not disturbed.
+  Windows values are opened with the DPAPI-protected key in the profile's
+  `Local State`, macOS with its Keychain entry, Linux with `secret-tool`. A
+  `v20` (app-bound) value is reported rather than guessed at. When the store
+  cannot be read - a browser holds it open, or the values are app-bound - a
+  running Chromium is asked over the debugging port its profile writes to
+  `DevToolsActivePort`: one local WebSocket read that never writes anything.
+  That fallback needs the browser to have been started with a debugging port
+  (`--remote-debugging-port`; `--remote-debugging-pipe` publishes no port).
+  A browser is asked at most once per minute while requests are running, and an
+  unauthorized answer drops that reuse at once.
+- **Notion web session (paste the Cookie header)** for browsers this build
+  cannot read: the complete Cookie request header of the user's own Notion web
+  session, an optional workspace UUID and an optional active-user UUID when the
+  browser holds several Notion identities.
+
+The workspace (`spaceId`) does not have to be typed. The session is asked for
+its spaces and each candidate is probed with `getAvailableModels` until one
+answers; that answer is also the model catalog that is then used, and it is
+remembered for 30 minutes per session. A workspace id may still be given
+explicitly and is checked to be a UUID before any request.
+
+A public Notion integration key does not grant access to Notion AI. Sessions
+expire; a sign-in taken from a browser is re-read rather than renewed by this
+package, so signing in again in that browser is what refreshes it.
 The model-list hook checks `authValidate` and the workspace catalog; it never
 returns a static model list after either check fails. This validation happens
 after the host saves the sign-in. Magpie passes `authorize(inputs)` only the
@@ -147,6 +174,13 @@ and 3600000 to change it. Client cancellation interrupts a waiting transcript
 reader as well as aborting HTTP fetches. This does not establish that Notion's
 server-side agent run has stopped.
 
+`browserReadMs` (default 60000) is how long a session that was read out of a
+browser is reused before the browser is asked again: reading one costs a copy of
+its cookie store or a round trip over its debugging port, which a busy machine
+can stretch to tens of seconds. Set it to 0 to read the browser on every
+request. A request that comes back unauthorized always drops the reused answer,
+so a renewed sign-in is picked up on the next request either way.
+
 ## Evidence and checks
 
 The real redacted NDJSON capture contains `agent_service_transcript_delta`
@@ -172,6 +206,7 @@ node --check index.mjs
 node --check core.mjs
 node --check protocol.mjs
 node --check transcript.mjs
+node --check session.mjs
 bun test
 node check.mjs
 ```

@@ -1,6 +1,6 @@
 {
   "name": "opencode-notion-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Notion AI (Business) as a magpie / OpenCode provider: sign in with your own Notion web session, use the workspace's live Notion AI model catalog, and see the plan's credit windows.",
   "type": "module",
   "main": "./index.mjs",
@@ -28,6 +28,7 @@
     "core.mjs",
     "index.mjs",
     "protocol.mjs",
+    "session.mjs",
     "transcript.mjs"
   ],
   "magpie": {
@@ -36,7 +37,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/resucdueff/magpie_notion.git"
+    "url": "git+https://github.com/resucdueff/magpie-notion.git"
   },
-  "homepage": "https://github.com/resucdueff/magpie_notion"
+  "homepage": "https://github.com/resucdueff/magpie-notion"
 }

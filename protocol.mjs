@@ -9,21 +9,34 @@ const catalogs = new Map()
 const TTL = 30 * 60 * 1000
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 
-function credentials(auth) {
+function cookie(auth) {
   if (auth?.type !== "api" || typeof auth.key !== "string" || !auth.key.trim() || /[\r\n]/.test(auth.key)) {
     throw new ProviderError(401, "session_required", "Sign in with the Notion web session's Cookie header.")
   }
-  const spaceId = auth.metadata?.spaceId
-  if (typeof spaceId !== "string" || !UUID.test(spaceId)) throw new ProviderError(400, "workspace_required", "The Notion sign-in needs a workspace UUID in spaceId.")
-  const activeUserId = auth.metadata?.activeUserId
-  if (activeUserId && (typeof activeUserId !== "string" || !UUID.test(activeUserId))) throw new ProviderError(400, "invalid_active_user", "The Notion active user id must be a UUID.")
-  return { cookie: auth.key.trim(), spaceId, activeUserId }
+  return auth.key.trim()
+}
+
+// credentials reads what the sign-in states: the Cookie header, and the
+// workspace and user where the account carries them. The workspace is not
+// required: an account without one has it resolved from the session itself, so
+// nobody has to type a UUID.
+function credentials(auth) {
+  const key = cookie(auth)
+  const metadata = auth?.metadata ?? {}
+  const spaceId = metadata.spaceId
+  if (spaceId !== undefined && (typeof spaceId !== "string" || !UUID.test(spaceId))) throw new ProviderError(400, "workspace_required", "The Notion workspace id must be a UUID.")
+  const activeUserId = metadata.activeUserId
+  if (activeUserId !== undefined && (typeof activeUserId !== "string" || !UUID.test(activeUserId))) throw new ProviderError(400, "invalid_active_user", "The Notion active user id must be a UUID.")
+  return { cookie: key, spaceId, activeUserId }
 }
 
 async function call(name, data, account, signal) {
+  const headers = { "Content-Type": "application/json", Cookie: account.cookie, Origin: ORIGIN }
+  if (account.spaceId) headers["x-notion-space-id"] = account.spaceId
+  if (account.activeUserId) headers["x-notion-active-user-header"] = account.activeUserId
   const response = await fetch(`${ORIGIN}/api/v3/${name}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Cookie: account.cookie, Origin: ORIGIN, "x-notion-space-id": account.spaceId, ...(account.activeUserId ? { "x-notion-active-user-header": account.activeUserId } : {}) },
+    headers,
     body: JSON.stringify(data), signal, redirect: "error",
   })
   if (!response.ok) {
@@ -32,6 +45,56 @@ async function call(name, data, account, signal) {
     throw new ProviderError(response.status, code, `Notion AI refused the request (HTTP ${response.status}).`)
   }
   return response
+}
+
+const resolved = new Map()
+const RESOLVED_TTL = 30 * 60 * 1000
+
+// workspace asks the session which workspace its AI can be asked in: getSpaces
+// names the ones the user belongs to, and the one that answers the model
+// catalog is the account's. The answer is kept, so the question is asked once
+// per session instead of on every request.
+async function workspace(read, signal) {
+  const key = digest(read.cookie)
+  const cached = resolved.get(key)
+  if (cached && Date.now() - cached.at < RESOLVED_TTL) return cached
+  const body = await json("getSpaces", {}, { cookie: read.cookie }, signal)
+  const candidates = []
+  let activeUserId
+  for (const entry of Object.values(body ?? {})) {
+    if (!entry || typeof entry !== "object") continue
+    for (const spaceId of Object.keys(entry.space ?? {})) if (UUID.test(spaceId) && !candidates.includes(spaceId)) candidates.push(spaceId)
+    for (const id of Object.keys(entry.notion_user ?? {})) if (UUID.test(id) && !activeUserId) activeUserId = id
+  }
+  if (!candidates.length) throw new ProviderError(404, "workspace_not_found", "This Notion session belongs to no workspace the AI can be asked in.")
+  const user = read.activeUserId ?? activeUserId
+  let last
+  for (const spaceId of candidates) {
+    const answer = { cookie: read.cookie, spaceId, activeUserId: user }
+    try {
+      const probe = await call("getAvailableModels", { spaceId }, answer, signal)
+      // The answer that names the workspace is the catalog itself, so it is
+      // kept rather than asked for again by the request that follows.
+      const payload = await probe.json().catch(() => undefined)
+      if (payload && Array.isArray(payload.models)) keepModels(digest([answer.cookie, spaceId, user]), payload)
+      else await probe.body?.cancel().catch(() => {})
+      while (resolved.size >= 256) resolved.delete(resolved.keys().next().value)
+      resolved.set(key, { spaceId, activeUserId: user, at: Date.now() })
+      return { spaceId, activeUserId: user, at: Date.now() }
+    } catch (error) {
+      last = error
+    }
+  }
+  throw last instanceof ProviderError ? last : new ProviderError(502, "workspace_unreadable", "Notion did not answer for any of this session's workspaces.")
+}
+
+// accountOf is the account a request runs as, with the workspace resolved from
+// the session when the sign-in did not state one.
+async function accountOf(auth, signal) {
+  const read = credentials(auth)
+  if (read.spaceId) return read
+  const found = await workspace(read, signal)
+  return { cookie: read.cookie, spaceId: found.spaceId, activeUserId: read.activeUserId ?? found.activeUserId }
 }
 
 async function json(name, data, account, signal) {
@@ -48,6 +111,12 @@ async function catalog(account, signal, refresh = false) {
   const cached = catalogs.get(key)
   if (!refresh && cached && Date.now() - cached.at < 60_000) return cached.models
   const response = await json("getAvailableModels", { spaceId: account.spaceId }, account, signal)
+  return keepModels(key, response)
+}
+
+// keepModels reads the catalog the way the web client shows it — minus what the
+// plan and the workspace don't serve — and keeps it for the next minute.
+function keepModels(key, response) {
   if (!Array.isArray(response.models)) throw new ProviderError(502, "invalid_model_catalog", "Notion AI returned an unsupported model catalog.")
   const models = response.modelSelectionRestricted || response.restrictedGeoHiddenModelModes?.includes("agent_service") ? [] : response.models.filter(eligible)
   while (catalogs.size >= 256) catalogs.delete(catalogs.keys().next().value)
@@ -145,13 +214,13 @@ const quotaError = (error) =>
   error instanceof ProviderError ? error.message : "The Notion AI quota could not be read."
 
 async function quota({ auth }) {
+  const signal = AbortSignal.timeout(30_000)
   let account
   try {
-    account = credentials(auth)
+    account = await accountOf(auth, signal)
   } catch (error) {
     return { error: quotaError(error), windows: [], signIn: error?.status === 401 ? "expired" : "kept" }
   }
-  const signal = AbortSignal.timeout(30_000)
   let payload
   try {
     payload = await json("getCreditRateLimitStatus", { spaceId: account.spaceId }, account, signal)
@@ -173,8 +242,8 @@ async function quota({ auth }) {
 
 export default {
   async models({ auth }) {
-    const account = credentials(auth)
     const signal = AbortSignal.timeout(30_000)
+    const account = await accountOf(auth, signal)
     const valid = await call("authValidate", {}, account, signal)
     await valid.body?.cancel().catch(() => {})
     if (valid.status !== 200) throw new ProviderError(401, "session_expired", "The Notion web session is not valid.")
@@ -182,7 +251,7 @@ export default {
     return Object.fromEntries(entries.map((entry) => [entry.model, modelEntry(entry)]))
   },
   async open({ auth, chat, signal }) {
-    const account = credentials(auth)
+    const account = await accountOf(auth, signal)
     const models = await catalog(account, signal)
     const model = models.find((entry) => entry.model === chat.model)
     if (!model) throw new ProviderError(403, "model_unavailable", "This Notion workspace does not offer the requested model for personal agents.")
@@ -249,4 +318,4 @@ export default {
   usage: quota,
 }
 
-export const _internal = { credentials, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows }
+export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows }

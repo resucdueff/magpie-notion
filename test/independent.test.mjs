@@ -256,7 +256,9 @@ test("catalog outage cannot be replaced by a static model", async () => {
 
 test("invalid auth and UUID metadata fail before any network request", async () => {
   const mock = mockNotion()
-  for (const invalidAuth of [{ type: "api", key: "x\r\ny", metadata: { spaceId: uuid } }, { ...auth, metadata: {} }, { ...auth, metadata: { spaceId: uuid, activeUserId: "invalid" } }]) {
+  // A workspace that is absent is not an error: it is discovered from the
+  // session (test/workspace.test.mjs). A workspace that is not a UUID still is.
+  for (const invalidAuth of [{ type: "api", key: "x\r\ny", metadata: { spaceId: uuid } }, { type: "api", key: "  ", metadata: {} }, { ...auth, metadata: { spaceId: uuid, activeUserId: "invalid" } }, { ...auth, metadata: { spaceId: "not-a-uuid" } }]) {
     expect((await request(chat(), { auth: invalidAuth })).status).toBeGreaterThanOrEqual(400)
   }
   expect(mock.calls).toHaveLength(0)
