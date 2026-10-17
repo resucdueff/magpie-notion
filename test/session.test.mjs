@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { execFile } from "node:child_process"
-import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
+import { createCipheriv, createHash, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
@@ -27,13 +27,15 @@ const nodeRuntime = await new Promise((resolve) => {
 const gcmSeal = (value, key, prefix = "v10") => {
   const nonce = randomBytes(12)
   const cipher = createCipheriv("aes-256-gcm", key, nonce)
-  const body = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()])
+  const plain = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8")
+  const body = Buffer.concat([cipher.update(plain), cipher.final()])
   return Buffer.concat([Buffer.from(prefix, "latin1"), nonce, body, cipher.getAuthTag()])
 }
 
 const cbcSeal = (value, key, prefix = "v10") => {
   const cipher = createCipheriv("aes-128-cbc", key, Buffer.alloc(16, " "))
-  return Buffer.concat([Buffer.from(prefix, "latin1"), cipher.update(String(value), "utf8"), cipher.final()])
+  const plain = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8")
+  return Buffer.concat([Buffer.from(prefix, "latin1"), cipher.update(plain), cipher.final()])
 }
 
 const capture = (fn) => { try { fn() } catch (error) { return error } }
@@ -185,7 +187,7 @@ test("the desktop keychain is asked under the name each browser files its key as
   const run = async (file, args) => { asked.push([file, ...args]); return "offline-key" }
   const mac = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "darwin", run })
   expect(mac).toMatchObject({ cipher: "cbc" })
-  expect(asked[0]).toEqual(["/usr/bin/security", "find-generic-password", "-w", "Microsoft Edge Safe Storage"])
+  expect(asked[0]).toEqual(["/usr/bin/security", "find-generic-password", "-w", "-s", "Microsoft Edge Safe Storage"])
   asked.length = 0
   const linux = await _internal.valueKey({ browser: "Edge", localState: "unused" }, { platform: "linux", run })
   expect(linux).toMatchObject({ cipher: "cbc" })
@@ -262,6 +264,43 @@ test("a v11 value and a value from a keychain build both open", () => {
 test("an empty value is nothing, never a failure", () => {
   expect(decryptValue(Buffer.alloc(0), undefined)).toBe("")
   expect(decryptValue(undefined, undefined)).toBe("")
+})
+
+// Chrome 130 (cookie schema version 24) seals the cookie's domain into the
+// value: the plaintext is the domain's SHA-256, then the value. Reading it
+// without dropping the digest gives a value whose first bytes are binary, and a
+// Cookie header carrying those bytes is refused outright.
+const domainBound = (host, value) => Buffer.concat([createHash("sha256").update(host).digest(), Buffer.from(value, "utf8")])
+
+test("a value that carries its own domain's digest is read as the value alone", () => {
+  const key = randomBytes(32)
+  const sealed = gcmSeal(domainBound(".notion.so", "token_v2=session"), key)
+  expect(decryptValue(sealed, { cipher: "gcm", key }, { platform: "win32", host: ".notion.so" })).toBe("token_v2=session")
+  // The digest is of the host_key exactly as the store writes it, so a store
+  // that filed the same cookie without the leading dot carries a different
+  // digest - and is read under that name, not under a tidied one.
+  const bare = gcmSeal(domainBound("notion.so", "token_v2=session"), key)
+  expect(decryptValue(bare, { cipher: "gcm", key }, { platform: "win32", host: "notion.so" })).toBe("token_v2=session")
+  expect(decryptValue(bare, { cipher: "gcm", key }, { platform: "win32", host: ".notion.so" }).endsWith("token_v2=session")).toBe(true)
+})
+
+test("a value with no domain digest is left whole", () => {
+  const key = randomBytes(32)
+  const sealed = gcmSeal("plain-session", key)
+  expect(decryptValue(sealed, { cipher: "gcm", key }, { platform: "win32", host: ".notion.so" })).toBe("plain-session")
+  // A value that carries another domain's digest is not this domain's to open,
+  // so it is reported as it was rather than shortened into something wrong.
+  const other = gcmSeal(domainBound(".example.com", "plain-session"), key)
+  const read = decryptValue(other, { cipher: "gcm", key }, { platform: "win32", host: ".notion.so" })
+  expect(read.endsWith("plain-session")).toBe(true)
+  expect(read.length).toBeGreaterThan("plain-session".length)
+})
+
+test("the digest is dropped on a keychain build too", () => {
+  const secret = "desktop-password"
+  const derived = pbkdf2Sync(secret, "saltysalt", 1003, 16, "sha1")
+  const sealed = cbcSeal(domainBound(".notion.so", "desktop-session"), derived)
+  expect(decryptValue(sealed, { cipher: "cbc", key: derived }, { platform: "darwin", host: ".notion.so" })).toBe("desktop-session")
 })
 
 test("a v20 value is reported for the fallback, never guessed", () => {
