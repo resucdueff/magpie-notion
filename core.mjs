@@ -5,11 +5,12 @@ const VIRTUAL_API = "https://notion.invalid/v1"
 const encoder = new TextEncoder()
 
 export class ProviderError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, options = {}) {
     super(message)
     this.status = status
     this.code = code
     if (status === 401) this.signIn = "expired"
+    if (options.retryAfter !== undefined) this.retryAfter = String(options.retryAfter)
   }
 }
 
@@ -19,9 +20,12 @@ function publicError(error) {
 }
 
 function errorResponse(error) {
+  const headers = {}
+  if (error?.signIn === "expired") headers["X-Magpie-Sign-In"] = "expired"
+  if (error?.retryAfter !== undefined) headers["Retry-After"] = error.retryAfter
   return Response.json({ error: publicError(error) }, {
     status: error instanceof ProviderError ? error.status : 502,
-    ...(error?.signIn === "expired" ? { headers: { "X-Magpie-Sign-In": "expired" } } : {}),
+    ...(Object.keys(headers).length ? { headers } : {}),
   })
 }
 
@@ -173,7 +177,7 @@ export function createPlugin(protocol, options = {}) {
         name: "Notion AI",
         npm: "@ai-sdk/openai-compatible",
         api: VIRTUAL_API,
-        models: { "omniberry-sundae": { name: "GPT-6.1 Sol", tool_call: false, attachment: false, modalities: { input: ["text"], output: ["text"] } } },
+        models: { "omniberry-sundae": { name: "Notion AI（登录后刷新模型列表）", tool_call: false, attachment: false, modalities: { input: ["text"], output: ["text"] } } },
       }
     },
     auth: {

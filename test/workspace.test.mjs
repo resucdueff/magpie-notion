@@ -16,11 +16,10 @@ const answer = (sequence) => ({ op: "put", entity: { id: "assistant", kind: "ass
 const completed = (sequence) => ({ op: "put", entity: { id: "done", kind: "turn_completed", sequence, stop_reason: "end_turn" } })
 const ndjson = (frames) => new Response(frames.map((value) => JSON.stringify(value)).join("\n") + "\n")
 const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
-const realFetch = globalThis.fetch
 
 function mockNotion(options = {}) {
   const calls = []
-  globalThis.fetch = async (url, init) => {
+  internals.useFetch(async (url, init) => {
     const name = new URL(url).pathname.split("/").at(-1)
     calls.push({ name, data: JSON.parse(init.body), headers: init.headers })
     const custom = await options.handle?.(name, calls.at(-1))
@@ -38,7 +37,7 @@ function mockNotion(options = {}) {
     if (name === "getCreditRateLimitStatus") return Response.json({ status: "not_applicable" })
     if (name === "getAIUsageEligibilityV2") return Response.json({})
     throw new Error("Unexpected offline endpoint " + name)
-  }
+  })
   return { calls, names: () => calls.map((call) => call.name) }
 }
 
@@ -49,7 +48,7 @@ async function asked(signal) {
 }
 
 beforeEach(() => { internals.resolved.clear(); internals.catalogs.clear(); internals.sessions.clear() })
-afterEach(() => { globalThis.fetch = realFetch })
+afterEach(() => { internals.useFetch(undefined) })
 
 test("a session that names no workspace finds the one its models answer for", async () => {
   const mock = mockNotion()
@@ -100,17 +99,17 @@ test("the user the session names is sent as the active user", async () => {
 
 test("the create request uses Chrome web headers and a normalized Cookie", async () => {
   const mock = mockNotion()
-  const stated = { type: "api", key: "token_v2={{SECRET_k3t7vnyw}}; notion_user_id=" + USER, metadata: { activeUserId: USER } }
+  const stated = { type: "api", key: "token_v2=" + "fake-token-v2" + "; notion_user_id=" + USER, metadata: { activeUserId: USER } }
   for await (const event of await protocol.open({ auth: stated, chat, signal: AbortSignal.timeout(5_000) })) void event
   const created = mock.calls.find((call) => call.name === "createAgentThread")
   const listen = mock.calls.find((call) => call.name === "listenToThreadTranscript")
-  // The replaced fetch observes creation too; impit is not imported in tests.
+  // The explicit fetch override observes creation too; impit is not imported.
   expect(mock.names().filter((name) => name === "createAgentThread")).toHaveLength(1)
   expect(created.headers.Accept).toBe("application/json")
   expect(listen.headers.Accept).toBe("application/x-ndjson")
   expect(created.headers["notion-audit-log-platform"]).toBe("web")
   expect(created.headers["Sec-Fetch-Site"]).toBe("same-origin")
-  expect(cookieValue(created.headers.Cookie, "token_v2")).toBe("{{SECRET_k3t7vnyw}}")
+  expect(cookieValue(created.headers.Cookie, "token_v2")).toBe("fake-token-v2")
   expect(cookieValue(created.headers.Cookie, "device_id")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
   expect(cookieValue(created.headers.Cookie, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
   expect(new Set(mock.calls.map((call) => cookieValue(call.headers.Cookie, "device_id"))).size).toBe(1)
@@ -212,6 +211,36 @@ test("every workspace refusing is reported with Notion's own status, not an empt
   mockNotion({ answerable: [] })
   const error = await asked(AbortSignal.timeout(5_000)).catch((failure) => failure)
   expect(error).toMatchObject({ status: 403, code: "workspace_forbidden" })
+})
+
+test("a later workspace with models wins over an earlier empty catalog", async () => {
+  const mock = mockNotion({
+    spaces: spaces([OTHER, SPACE]),
+    handle: (name, call) => name === "getAvailableModels" && call.data.spaceId === OTHER ? Response.json({ models: [] }) : undefined,
+  })
+  for await (const event of await protocol.open({ auth, chat, signal: AbortSignal.timeout(5_000) })) void event
+  expect(mock.calls.find((call) => call.name === "createAgentThread").data.spaceId).toBe(SPACE)
+  expect([...internals.resolved.values()][0]).toMatchObject({ spaceId: SPACE, activeUserId: USER })
+})
+
+test("a damaged catalog is skipped in favor of the next readable workspace", async () => {
+  const mock = mockNotion({
+    spaces: spaces([OTHER, SPACE]),
+    handle: (name, call) => name === "getAvailableModels" && call.data.spaceId === OTHER ? new Response("not-json") : undefined,
+  })
+  for await (const event of await protocol.open({ auth, chat, signal: AbortSignal.timeout(5_000) })) void event
+  expect(mock.calls.find((call) => call.name === "createAgentThread").data.spaceId).toBe(SPACE)
+  expect([...internals.resolved.values()][0]).toMatchObject({ spaceId: SPACE, activeUserId: USER })
+})
+
+test("when every readable workspace is empty, the first one supplies an empty catalog", async () => {
+  const mock = mockNotion({
+    spaces: spaces([OTHER, SPACE]),
+    handle: (name) => name === "getAvailableModels" ? Response.json({ models: [] }) : undefined,
+  })
+  expect(await protocol.models({ auth })).toEqual({})
+  expect([...internals.resolved.values()][0]).toMatchObject({ spaceId: OTHER, activeUserId: USER })
+  expect(mock.calls.filter((call) => call.name === "getAvailableModels").map((call) => call.data.spaceId)).toEqual([OTHER, SPACE, OTHER])
 })
 
 test("a session in no workspace at all is a clear error before any model call", async () => {

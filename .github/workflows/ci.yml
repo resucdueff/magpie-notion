@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
       - run: node scripts/check-secrets.mjs
       - run: node check.mjs
+      - run: node --input-type=module -e "const { Impit } = await import('impit'); new Impit({ browser: 'chrome' })"
       - run: bun test

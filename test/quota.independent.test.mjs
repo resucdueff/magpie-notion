@@ -1,11 +1,11 @@
 import { afterEach, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { NotionPlugin } from "../index.mjs"
+import { _internal as protocolInternals } from "../protocol.mjs"
 
 // The fixture is a redacted live getCreditRateLimitStatus response. Assertions
 // follow https://usemagpie.ai/docs/plugins#usage, not CodexBar UI fields.
 const realFixture = JSON.parse(readFileSync(new URL("../fixtures/real-quota.json", import.meta.url)))
-const realFetch = globalThis.fetch
 const token = "offline-token-v2"
 const auth = { type: "api", key: token, metadata: { spaceId: "11111111-1111-4111-8111-111111111111", activeUserId: "22222222-2222-4222-8222-222222222222" } }
 const copy = () => structuredClone(realFixture)
@@ -18,11 +18,11 @@ const premiumFixture = {
     perSource: { monthlyAllocated: { limit: 300, usageTotal: 0 }, monthlyCommitted: { limit: 0, usageTotal: 0 }, stackedTrial: { limit: 0, usageTotal: 0 }, yearlyElastic: { limit: 0, usageTotal: 0 } },
   },
 }
-afterEach(() => { globalThis.fetch = realFetch })
+afterEach(() => { protocolInternals.useFetch(undefined) })
 
 async function usage(payload = copy(), options = {}) {
   const calls = []
-  globalThis.fetch = async (url, init) => {
+  protocolInternals.useFetch(async (url, init) => {
     const name = new URL(url).pathname.split("/").at(-1)
     calls.push({ name, url: String(url), ...init })
     if (options.throw) throw new Error("private-quota-diagnostic")
@@ -35,7 +35,7 @@ async function usage(payload = copy(), options = {}) {
     if (options.status) return new Response("private-quota-diagnostic", { status: options.status })
     if (options.invalidJSON) return new Response("private-quota-diagnostic")
     return Response.json(payload)
-  }
+  })
   const hooks = await NotionPlugin()
   expect(typeof hooks.auth.usage).toBe("function")
   const result = await hooks.auth.usage(async () => options.auth ?? auth)
@@ -219,7 +219,7 @@ test("quota: invalid account metadata fails before network traffic", async () =>
 })
 
 test("quota: inference HTTP 401 also sends Magpie's expired response header", async () => {
-  globalThis.fetch = async () => new Response("private-quota-diagnostic", { status: 401 })
+  protocolInternals.useFetch(async () => new Response("private-quota-diagnostic", { status: 401 }))
   const hooks = await NotionPlugin()
   const loader = await hooks.auth.loader(async () => auth)
   const response = await loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "offline" }] }) })

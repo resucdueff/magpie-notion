@@ -9,8 +9,20 @@ const catalogs = new Map()
 const TTL = 30 * 60 * 1000
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const moduleFetch = globalThis.fetch
+const CONTROL = /[\x00-\x1f\x7f]/
+const READ_RETRIES = new Set([
+  "getSpaces",
+  "getAvailableModels",
+  "authValidate",
+  "getThreadTranscript",
+  "getCreditRateLimitStatus",
+  "getAIUsageEligibilityV2",
+])
+const MAX_READ_RETRIES = 2
+const MAX_BACKWARD_PAGES = 8
 let impitClient
 let impitLoading
+let fetchOverride
 
 // A stable UUID for Notion's device cookie. The session token selects it, so
 // repeated requests look like one browser without writing a new identifier
@@ -72,10 +84,11 @@ async function impit() {
 }
 
 async function request(name, url, init) {
-  // Only thread creation needs Chrome's browser fingerprint. Tests replace the
-  // global fetch after this module loads, so the mock also observes creation
-  // and the suite never imports impit's native dependency.
-  if (name !== "createAgentThread" || globalThis.fetch !== moduleFetch) return globalThis.fetch(url, init)
+  if (fetchOverride) return fetchOverride(url, init)
+  // Only thread creation needs Chrome's browser fingerprint. Other calls keep
+  // the fetch captured at module load so a host replacing globalThis.fetch
+  // cannot silently change their transport.
+  if (name !== "createAgentThread") return moduleFetch(url, init)
   const client = await impit()
   try {
     return await client.fetch(url, init)
@@ -89,18 +102,41 @@ async function request(name, url, init) {
   }
 }
 
+function useFetch(fetch) {
+  if (fetch !== undefined && typeof fetch !== "function") throw new TypeError("The Notion fetch override must be a function.")
+  fetchOverride = fetch
+}
+
+function wait(ms, signal) {
+  if (!ms) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms)
+    function done() {
+      signal?.removeEventListener("abort", aborted)
+      resolve()
+    }
+    function aborted() {
+      clearTimeout(timer)
+      signal.removeEventListener("abort", aborted)
+      reject(signal.reason)
+    }
+    if (signal?.aborted) aborted()
+    else signal?.addEventListener("abort", aborted, { once: true })
+  })
+}
+
 // Accept either the token value by itself or a Cookie header the user pasted by
 // mistake. Only token_v2 is kept, so unrelated pasted cookies never reach the
 // upstream request.
 function cookie(auth) {
   const reject = () => new ProviderError(401, "session_required", "请粘贴 Notion 的 token_v2。")
-  if (auth?.type !== "api" || typeof auth.key !== "string" || /[\r\n]/.test(auth.key)) throw reject()
+  if (auth?.type !== "api" || typeof auth.key !== "string" || CONTROL.test(auth.key)) throw reject()
   const pasted = auth.key.trim().replace(/^Cookie\s*:\s*/i, "")
   if (!pasted) throw reject()
   const field = cookieFields(pasted).find((entry) => entry.name === "token_v2")
   if (field) {
     const token = field.value?.trim()
-    if (!token) throw reject()
+    if (!token || CONTROL.test(token)) throw reject()
     return `token_v2=${token}`
   }
   // A Cookie header without token_v2 is not a token, even when it has one field.
@@ -143,17 +179,23 @@ async function call(name, data, account, signal) {
   }
   if (account.spaceId) headers["x-notion-space-id"] = account.spaceId
   if (account.activeUserId) headers["x-notion-active-user-header"] = account.activeUserId
-  const response = await request(name, `${ORIGIN}/api/v3/${name}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(data), signal, redirect: "error",
-  })
-  if (!response.ok) {
+  for (let attempt = 0; ; attempt++) {
+    const response = await request(name, `${ORIGIN}/api/v3/${name}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(data), signal, redirect: "error",
+    })
+    if (response.ok) return response
+    const retryAfter = response.headers.get("Retry-After")?.trim()
+    const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
     await response.body?.cancel().catch(() => {})
+    if (response.status === 429 && READ_RETRIES.has(name) && attempt < MAX_READ_RETRIES && Number.isSafeInteger(seconds) && seconds <= 5) {
+      await wait(seconds * 1000, signal)
+      continue
+    }
     const code = response.status === 401 ? "session_expired" : response.status === 403 ? "workspace_forbidden" : response.status === 429 ? "rate_limited" : "upstream_http_error"
-    throw new ProviderError(response.status, code, `Notion AI refused the request (HTTP ${response.status}).`)
+    throw new ProviderError(response.status, code, `Notion AI refused the request (HTTP ${response.status}).`, retryAfter ? { retryAfter } : undefined)
   }
-  return response
 }
 
 const resolved = new Map()
@@ -191,6 +233,7 @@ async function workspace(read, signal) {
   }
   if (!candidates.length) throw new ProviderError(404, "workspace_not_found", "This Notion session belongs to no workspace the AI can be asked in.")
   let last
+  let readable
   for (const spaceId of candidates) {
     // A user the sign-in states is the account it meant; otherwise the entry
     // that lists this workspace names the user it belongs to.
@@ -200,15 +243,28 @@ async function workspace(read, signal) {
       const probe = await call("getAvailableModels", { spaceId }, answer, signal)
       // The answer that names the workspace is the catalog itself, so it is
       // kept rather than asked for again by the request that follows.
-      const payload = await probe.json().catch(() => undefined)
-      if (payload && Array.isArray(payload.models)) keepModels(digest([answer.cookie, spaceId, user]), payload)
-      else await probe.body?.cancel().catch(() => {})
+      const payload = await probe.json().catch(async () => {
+        await probe.body?.cancel().catch(() => {})
+        return undefined
+      })
+      if (!payload || !Array.isArray(payload.models)) {
+        await probe.body?.cancel().catch(() => {})
+        continue
+      }
+      const models = keepModels(digest([answer.cookie, spaceId, user]), payload)
+      readable ??= answer
+      if (!models.length) continue
       while (resolved.size >= 256) resolved.delete(resolved.keys().next().value)
       resolved.set(key, { spaceId, activeUserId: user, at: Date.now() })
       return { spaceId, activeUserId: user, at: Date.now() }
     } catch (error) {
       last = error
     }
+  }
+  if (readable) {
+    while (resolved.size >= 256) resolved.delete(resolved.keys().next().value)
+    resolved.set(key, { ...readable, at: Date.now() })
+    return { ...readable, at: Date.now() }
   }
   throw last instanceof ProviderError ? last : new ProviderError(502, "workspace_unreadable", "Notion did not answer for any of this session's workspaces.")
 }
@@ -276,10 +332,27 @@ function content(value) {
 }
 
 function take(key) {
-  for (const [entry, value] of sessions) if (Date.now() - value.at > TTL) sessions.delete(entry)
+  for (const [entry, value] of sessions) {
+    if (Date.now() - value.at > TTL) {
+      sessions.delete(entry)
+      claims.delete(entry)
+    }
+  }
   const value = sessions.get(key)
-  sessions.delete(key) // A thread can only advance from this exact history once.
+  if (!value || claims.has(key)) return undefined
+  claims.add(key)
   return value
+}
+
+const claims = new Set()
+
+function release(key) {
+  claims.delete(key)
+}
+
+function forget(key) {
+  sessions.delete(key)
+  claims.delete(key)
 }
 
 function remember(key, threadId, sequence) {
@@ -347,6 +420,35 @@ function quotaWindows(data) {
 const quotaError = (error) =>
   error instanceof ProviderError ? error.message : "The Notion AI quota could not be read."
 
+function transcriptPage(body) {
+  if (body?.type !== "agent_service_transcript_page" || !Array.isArray(body.patches)) throw new ProviderError(502, "invalid_transcript", "Notion AI returned an unsupported transcript page.")
+  return body
+}
+
+function crossedBoundary(page, afterSequence) {
+  return afterSequence > 0 && page.patches.some((patch) => {
+    const sequence = patch.op === "put" ? patch.entity?.sequence : undefined
+    return Number.isSafeInteger(sequence) && sequence <= afterSequence
+  })
+}
+
+async function transcriptPages(account, threadId, afterSequence, signal) {
+  const latest = transcriptPage(await json("getThreadTranscript", { spaceId: account.spaceId, threadId, direction: "backward", limit: 10 }, account, signal))
+  if (crossedBoundary(latest, afterSequence)) return [latest]
+  const pages = [latest]
+  const seen = new Set()
+  let page = latest
+  for (let count = 0; count < MAX_BACKWARD_PAGES; count++) {
+    const cursor = page.backward_cursor
+    if (typeof cursor !== "string" || !cursor || page.has_more_backward === false || seen.has(cursor)) break
+    seen.add(cursor)
+    page = transcriptPage(await json("getThreadTranscript", { spaceId: account.spaceId, threadId, direction: "backward", cursor, limit: 10 }, account, signal))
+    pages.unshift(page)
+    if (crossedBoundary(page, afterSequence)) break
+  }
+  return pages
+}
+
 async function quota({ auth }) {
   const signal = AbortSignal.timeout(30_000)
   let account
@@ -380,7 +482,6 @@ export default {
     const account = await accountOf(auth, signal)
     const valid = await call("authValidate", {}, account, signal)
     await valid.body?.cancel().catch(() => {})
-    if (valid.status !== 200) throw new ProviderError(401, "session_expired", "The Notion web session is not valid.")
     const entries = await catalog(account, signal, true)
     return Object.fromEntries(entries.map((entry) => [entry.model, modelEntry(entry)]))
   },
@@ -388,7 +489,7 @@ export default {
     const account = await accountOf(auth, signal)
     const models = await catalog(account, signal)
     const model = models.find((entry) => entry.model === chat.model)
-    if (!model) throw new ProviderError(403, "model_unavailable", "This Notion workspace does not offer the requested model for personal agents.")
+    if (!model) throw new ProviderError(403, "model_unavailable", "This Notion workspace does not offer the requested model for personal agents. Refresh the model list after signing in.")
     const effort = chat.reasoning_effort ?? model.modelConfiguration?.defaultReasoningEffort
     if (effort !== undefined && !model.modelConfiguration?.supportedReasoningEfforts?.includes(effort)) {
       throw new ProviderError(400, "reasoning_effort_unavailable", "The requested reasoning effort is not offered for this Notion model.")
@@ -397,19 +498,37 @@ export default {
     if (last.role !== "user") throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
     const accountId = digest([account.cookie, account.spaceId, account.activeUserId, chat.model, effort])
     const historyKey = (messages) => digest([accountId, messages])
-    let previous = take(historyKey(chat.messages.slice(0, -1)))
+    const previousKey = historyKey(chat.messages.slice(0, -1))
+    let previous = take(previousKey)
+    let claimedKey = previous ? previousKey : undefined
     let afterSequence = 0
     if (previous) {
-      const before = await json("getThreadTranscript", { spaceId: account.spaceId, threadId: previous.threadId, direction: "backward", limit: 10 }, account, signal)
-      // If the user advanced this thread in Notion, the client's history is no
-      // longer its history. Start a new thread instead of mixing conversations.
-      if (before.session?.sequence !== previous.sequence || before.session?.status !== "idle") previous = undefined
-      else afterSequence = previous.sequence
+      try {
+        const before = await json("getThreadTranscript", { spaceId: account.spaceId, threadId: previous.threadId, direction: "backward", limit: 10 }, account, signal)
+        // If the user advanced this thread in Notion, the client's history is
+        // no longer its history. Start a new thread instead of mixing them.
+        if (before.session?.sequence !== previous.sequence) {
+          forget(previousKey)
+          claimedKey = undefined
+          previous = undefined
+        } else if (before.session?.status !== "idle") {
+          release(previousKey)
+          claimedKey = undefined
+          previous = undefined
+        } else {
+          afterSequence = previous.sequence
+          await json("sendEventToAgentThread", { spaceId: account.spaceId, threadId: previous.threadId, event: { type: "user.message", content: content(last.content) }, surface: "full_page_chat", clientEventId: randomUUID() }, account, signal)
+          forget(previousKey)
+          claimedKey = undefined
+        }
+      } catch (error) {
+        if (claimedKey) release(claimedKey)
+        throw error
+      }
     }
     let threadId
     if (previous) {
       threadId = previous.threadId
-      await json("sendEventToAgentThread", { spaceId: account.spaceId, threadId, event: { type: "user.message", content: content(last.content) }, surface: "full_page_chat", clientEventId: randomUUID() }, account, signal)
     } else {
       threadId = randomUUID()
       const created = await json("createAgentThread", {
@@ -423,8 +542,9 @@ export default {
       if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
       threadId = created.threadId
     }
-    const page = await json("getThreadTranscript", { spaceId: account.spaceId, threadId, direction: "backward", limit: 10 }, account, signal)
-    if (page.type !== "agent_service_transcript_page" || !Array.isArray(page.patches)) throw new ProviderError(502, "invalid_transcript", "Notion AI returned an unsupported transcript page.")
+    const pages = await transcriptPages(account, threadId, afterSequence, signal)
+    const newest = pages.at(-1)
+    const page = pages.length === 1 ? newest : { ...newest, patches: pages.flatMap((entry) => entry.patches) }
     if (afterSequence === 0 || page.session?.sequence > afterSequence || page.session?.last_turn_allowance?.sequence > afterSequence) sessionError(page.session)
     const completedOnPage = page.patches.some((patch) => patch.op === "put" && patch.entity?.kind === "turn_completed" && patch.entity.sequence > afterSequence)
     let liveResponse
@@ -443,7 +563,7 @@ export default {
       try {
         for await (const event of transcriptEvents(frames(), signal, { afterSequence })) {
           if (event.type === "text") answer += event.text
-          else if (event.type === "done") remember(historyKey([...chat.messages, { role: "assistant", content: typeof event.text === "string" ? event.text : answer }]), threadId, event.sequence)
+          else if (event.type === "done") remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence)
           yield event
         }
       } finally { await liveResponse?.body?.cancel().catch(() => {}) }
@@ -452,4 +572,4 @@ export default {
   usage: quota,
 }
 
-export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows }
+export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, useFetch }

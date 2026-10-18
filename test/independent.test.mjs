@@ -5,7 +5,6 @@ import protocol, { _internal as internals } from "../protocol.mjs"
 import { readNDJSON, transcriptEvents } from "../transcript.mjs"
 import { NotionPlugin } from "../index.mjs"
 
-const originalFetch = globalThis.fetch
 const uuid = "11111111-1111-4111-8111-111111111111"
 const user = "22222222-2222-4222-8222-222222222222"
 const token = "offline-token-v2"
@@ -15,7 +14,7 @@ const chat = (messages = [{ role: "user", content: "First" }], more = {}) => ({ 
 const message = (text, sequence = 1, id = "assistant") => ({ op: "put", entity: { id, kind: "assistant_message", sequence, content: [{ type: "text", text }] } })
 const done = (sequence = 2, reason = "end_turn") => ({ op: "put", entity: { id: "done-" + sequence, kind: "turn_completed", sequence, stop_reason: reason } })
 const frame = (...patches) => ({ type: "agent_service_transcript_delta", patches })
-const page = (patches = [], sequence = 0, status = "running") => ({ type: "agent_service_transcript_page", patches, session: { sequence, status }, forward_cursor: "offline-cursor" })
+const page = (patches = [], sequence = 0, status = "running", extra = {}) => ({ type: "agent_service_transcript_page", patches, session: { sequence, status }, forward_cursor: "offline-cursor", ...extra })
 const collect = async (iterable) => { const out = []; for await (const item of iterable) out.push(item); return out }
 const iterable = async function* (values) { yield* values }
 const ndjson = (frames) => new Response(frames.map((v) => JSON.stringify(v)).join("\n") + "\n")
@@ -25,7 +24,7 @@ function mockNotion(options = {}) {
   const calls = []
   let creates = 0
   let sends = 0
-  globalThis.fetch = async (url, init) => {
+  internals.useFetch(async (url, init) => {
     const name = new URL(url).pathname.split("/").at(-1)
     const data = JSON.parse(init.body)
     calls.push({ name, data, init, url: String(url) })
@@ -37,7 +36,7 @@ function mockNotion(options = {}) {
     if (name === "getThreadTranscript") return Response.json(page([], sends ? 2 : 0, sends ? "idle" : "running"))
     if (name === "listenToThreadTranscript") return ndjson([frame(message(sends ? "Second answer" : "First answer", sends ? 3 : 1), done(sends ? 4 : 2))])
     throw new Error("Unexpected offline endpoint " + name)
-  }
+  })
   return { calls, get creates() { return creates }, get sends() { return sends } }
 }
 
@@ -53,8 +52,8 @@ async function firstTurn() {
   return [...chat().messages, result.choices[0].message, { role: "user", content: "Second" }]
 }
 
-beforeEach(() => { internals.sessions.clear(); internals.catalogs.clear() })
-afterEach(() => { globalThis.fetch = originalFetch })
+beforeEach(() => { internals.sessions.clear(); internals.catalogs.clear(); internals.resolved.clear() })
+afterEach(() => { internals.useFetch(undefined) })
 
 test("real redacted capture survives one-byte UTF-8 chunk boundaries", async () => {
 const source = readFileSync(new URL("../fixtures/real-stream.ndjson", import.meta.url))
@@ -138,6 +137,22 @@ test("exact continuation sends only last user text on existing thread", async ()
   expect(mock.calls.find((v) => v.name === "sendEventToAgentThread").data.event.content[0].text).toEqual([["Second"]])
 })
 
+test("a failed transcript read keeps the same history reusable", async () => {
+  const mock = mockNotion({ handle: (name, data, calls) => {
+    if (name !== "getThreadTranscript") return
+    const reads = calls.filter((v) => v.name === "getThreadTranscript").length
+    if (reads === 2) return new Response(null, { status: 503 })
+    if (reads === 3) return Response.json(page([], 2, "idle"))
+  } })
+  const history = await firstTurn()
+  expect((await request(chat(history))).status).toBe(503)
+  expect(internals.sessions.size).toBe(1)
+  const retried = await request(chat(history))
+  expect((await retried.json()).choices[0].message.content).toBe("Second answer")
+  expect(mock.creates).toBe(1)
+  expect(mock.sends).toBe(1)
+})
+
 test.each(["cookie", "workspace", "active-user", "model-effort", "history"])("history isolation: %s starts a fresh thread", async (dimension) => {
   const mock = mockNotion()
   const history = await firstTurn()
@@ -158,6 +173,39 @@ test("a stale or running Notion thread starts a fresh thread", async () => {
   await (await request(chat(await firstTurn()))).json()
   expect(mock.creates).toBe(2)
   expect(mock.sends).toBe(0)
+})
+
+test("a divergent cached transcript is forgotten instead of probed on every retry", async () => {
+  let originalThreadId
+  let originalReads = 0
+  const mock = mockNotion({ handle: (name, data) => {
+    if (name === "createAgentThread" && originalThreadId === undefined) originalThreadId = data.threadId
+    if (name === "getThreadTranscript" && data.threadId === originalThreadId && ++originalReads === 2) return Response.json(page([], 3, "idle"))
+  } })
+  const history = await firstTurn()
+  await (await request(chat(history))).json()
+  await (await request(chat(history))).json()
+  expect(mock.creates).toBe(3)
+  expect(mock.sends).toBe(0)
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript" && call.data.threadId === originalThreadId)).toHaveLength(2)
+})
+
+test("a temporarily running thread stays cached for a later continuation", async () => {
+  let originalThreadId
+  let originalReads = 0
+  const mock = mockNotion({ handle: (name, data) => {
+    if (name === "createAgentThread" && originalThreadId === undefined) originalThreadId = data.threadId
+    if (name !== "getThreadTranscript" || data.threadId !== originalThreadId) return
+    originalReads++
+    if (originalReads === 2) return Response.json(page([], 2, "running"))
+    if (originalReads === 3) return Response.json(page([], 2, "idle"))
+  } })
+  const history = await firstTurn()
+  await (await request(chat(history))).json()
+  await (await request(chat(history))).json()
+  expect(mock.creates).toBe(2)
+  expect(mock.sends).toBe(1)
+  expect(mock.calls.find((call) => call.name === "sendEventToAgentThread").data.threadId).toBe(originalThreadId)
 })
 
 test("a cached history may advance only once", async () => {
@@ -195,7 +243,7 @@ test("expired history starts a new thread", async () => {
 })
 
 test("transport exceptions never expose private diagnostics", async () => {
-  globalThis.fetch = async () => { throw new Error("private-session-and-workspace-diagnostic") }
+  internals.useFetch(async () => { throw new Error("private-session-and-workspace-diagnostic") })
   const response = await request(chat())
   expect(response.status).toBe(502)
   expect(await response.text()).not.toContain("private-session-and-workspace-diagnostic")
@@ -229,6 +277,18 @@ test("a malformed completion without a committed sequence is rejected", async ()
   expect(internals.sessions.size).toBe(0)
 })
 
+test("a completed backward page is joined with the earlier answer page", async () => {
+  const mock = mockNotion({ handle: (name, data) => {
+    if (name !== "getThreadTranscript") return
+    if (data.cursor === "older-page") return Response.json(page([message("Earlier answer", 3)], 3, "idle", { has_more_backward: false }))
+    return Response.json(page([done(4)], 4, "idle", { backward_cursor: "older-page", has_more_backward: true }))
+  } })
+  const response = await request(chat())
+  expect((await response.json()).choices[0].message.content).toBe("Earlier answer")
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript").map((call) => call.data.cursor)).toEqual([undefined, "older-page"])
+  expect(mock.calls.filter((call) => call.name === "listenToThreadTranscript")).toHaveLength(0)
+})
+
 test.each([[401, "session_expired"], [403, "workspace_forbidden"], [429, "rate_limited"], [402, "upstream_http_error"]])("HTTP %i is preserved with %s and no upstream secrets", async (status, code) => {
   mockNotion({ handle: () => new Response("upstream-private-account-data", { status }) })
   const response = await request(chat())
@@ -238,12 +298,72 @@ test.each([[401, "session_expired"], [403, "workspace_forbidden"], [429, "rate_l
   expect(body).not.toContain("upstream-private-account-data")
 })
 
+test("an idempotent read retries a short Retry-After", async () => {
+  let attempts = 0
+  mockNotion({ handle: (name) => name === "authValidate" && ++attempts === 1 ? new Response(null, { status: 429, headers: { "Retry-After": "0" } }) : undefined })
+  expect(Object.keys(await protocol.models({ auth }))).toEqual([model.model])
+  expect(attempts).toBe(2)
+})
+
+test("a read retries at most twice and preserves Retry-After on the final 429", async () => {
+  const mock = mockNotion({ handle: (name) => name === "getThreadTranscript" ? new Response(null, { status: 429, headers: { "Retry-After": "0" } }) : undefined })
+  const response = await request(chat())
+  expect(response.status).toBe(429)
+  expect(response.headers.get("Retry-After")).toBe("0")
+  expect(response.headers.get("X-Magpie-Sign-In")).toBeNull()
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript")).toHaveLength(3)
+  expect(await response.text()).not.toContain("session_expired")
+})
+
+test.each(["10", "Wed, 21 Oct 2015 07:28:00 GMT"])("a long or date Retry-After is returned without retrying: %s", async (retryAfter) => {
+  const mock = mockNotion({ handle: (name) => name === "getThreadTranscript" ? new Response(null, { status: 429, headers: { "Retry-After": retryAfter } }) : undefined })
+  const response = await request(chat())
+  expect(response.status).toBe(429)
+  expect(response.headers.get("Retry-After")).toBe(retryAfter)
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript")).toHaveLength(1)
+})
+
+test("503 is not retried", async () => {
+  const mock = mockNotion({ handle: (name) => name === "getThreadTranscript" ? new Response(null, { status: 503 }) : undefined })
+  expect((await request(chat())).status).toBe(503)
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript")).toHaveLength(1)
+})
+
+test("thread creation is not retried on 429", async () => {
+  const mock = mockNotion({ handle: (name) => name === "createAgentThread" ? new Response(null, { status: 429, headers: { "Retry-After": "0" } }) : undefined })
+  const response = await request(chat())
+  expect(response.status).toBe(429)
+  expect(response.headers.get("Retry-After")).toBe("0")
+  expect(mock.calls.filter((call) => call.name === "createAgentThread")).toHaveLength(1)
+})
+
+test("sending a thread event is not retried on 429", async () => {
+  const mock = mockNotion({ handle: (name, data, calls) => {
+    if (name === "getThreadTranscript" && calls.filter((v) => v.name === "getThreadTranscript").length === 2) return Response.json(page([], 2, "idle"))
+    if (name === "sendEventToAgentThread") return new Response(null, { status: 429, headers: { "Retry-After": "0" } })
+  } })
+  const history = await firstTurn()
+  const response = await request(chat(history))
+  expect(response.status).toBe(429)
+  expect(response.headers.get("Retry-After")).toBe("0")
+  expect(mock.calls.filter((call) => call.name === "sendEventToAgentThread")).toHaveLength(1)
+  expect(mock.creates).toBe(1)
+  expect(internals.sessions.size).toBe(1)
+})
+
 test("catalog restrictions and disabled models are respected without static fallback", async () => {
   mockNotion({ handle: (name) => name === "getAvailableModels" ? Response.json({ models: [model, { ...model, model: "disabled", isDisabled: true }, { ...model, model: "restricted", restrictedForPersonalAgent: true }, { ...model, model: "not-agent", agentService: null }] }) : undefined })
   const models = await protocol.models({ auth })
   expect(Object.keys(models)).toEqual([model.model])
   const response = await request(chat(undefined, { model: "omniberry-sundae" }))
   expect(response.status).toBe(403)
+  expect((await response.json()).error.message).toContain("Refresh the model list")
+})
+
+test("the pre-login placeholder keeps its id and explains how to refresh", async () => {
+  const config = {}
+  await createPlugin(protocol).config(config)
+  expect(config.provider.notion.models["omniberry-sundae"]).toMatchObject({ name: "Notion AI（登录后刷新模型列表）", tool_call: false })
 })
 
 test("workspace-wide model restriction yields no eligible models", async () => {
@@ -281,6 +401,19 @@ test("invalid pasted tokens and UUID metadata fail before any network request", 
   expect(leakedBody).not.toContain("private-pasted-token")
   expect((await request(chat(), { auth: { ...auth, metadata: { spaceId: uuid, activeUserId: "invalid" } } })).status).toBe(400)
   expect((await request(chat(), { auth: { ...auth, metadata: { spaceId: "not-a-uuid" } } })).status).toBe(400)
+  expect(mock.calls).toHaveLength(0)
+})
+
+test("control characters are refused without echoing the pasted token", async () => {
+  const mock = mockNotion()
+  for (const control of ["\x00", "\x1f", "\x7f"]) {
+    const secret = `private${control}token`
+    const response = await request(chat(), { auth: { type: "api", key: `token_v2=${secret}`, metadata: {} } })
+    const body = await response.text()
+    expect(response.status).toBe(401)
+    expect(body).toContain("请粘贴 Notion 的 token_v2。")
+    expect(body).not.toContain("private")
+  }
   expect(mock.calls).toHaveLength(0)
 })
 
@@ -341,7 +474,7 @@ test("package entry exports only the plugin and all declared runtime files exist
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url)))
   const plugin = await NotionPlugin()
   expect(Object.keys(await import("../index.mjs"))).toEqual(["NotionPlugin"])
-  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.1" })
+  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.2" })
   expect(pkg.description).toContain("token_v2")
   expect(plugin.auth.provider).toBe("notion")
   expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
@@ -424,10 +557,10 @@ test.each([
   }
 })
 
-test("model enumeration validates session HTTP status before using a catalog", async () => {
+test("model enumeration accepts a successful authValidate response without a body", async () => {
   const mock = mockNotion({ handle: (name) => name === "authValidate" ? new Response(null, { status: 204 }) : undefined })
-  await expect(protocol.models({ auth })).rejects.toMatchObject({ status: 401, code: "session_expired" })
-  expect(mock.calls.map((v) => v.name)).toEqual(["authValidate"])
+  expect(Object.keys(await protocol.models({ auth }))).toEqual([model.model])
+  expect(mock.calls.map((v) => v.name)).toEqual(["authValidate", "getAvailableModels"])
 })
 
 test("total request timeout aborts a stalled upstream with a sanitized 504", async () => {
@@ -441,15 +574,25 @@ test("total request timeout aborts a stalled upstream with a sanitized 504", asy
 })
 
 test("a committed answer shorter than the provisional text is not a failure", async () => {
-  mockNotion({ handle: (name) => name === "listenToThreadTranscript" ? ndjson([
-    frame(message("Hello world, this is the provisional stream", 1, "provisional")),
-    frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
-  ]) : undefined })
+  const provisional = "Hello world, this is the provisional stream"
+  const mock = mockNotion({ handle: (name, data, calls) => {
+    if (name === "getThreadTranscript" && calls.filter((v) => v.name === "getThreadTranscript").length === 2) return Response.json(page([], 2, "idle"))
+    if (name === "listenToThreadTranscript" && !calls.some((v) => v.name === "sendEventToAgentThread")) return ndjson([
+      frame(message(provisional, 1, "provisional")),
+      frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+    ])
+  } })
   const response = await request(chat())
   expect(response.status).toBe(200)
-  // The committed message is the answer, even though the provisional text that
-  // was streamed before it was longer.
-  expect((await response.json()).choices[0].message.content).toBe("Hello")
+  const first = await response.json()
+  // Text already sent cannot be taken back, so this is also the text cached for
+  // the next turn.
+  expect(first.choices[0].message.content).toBe(provisional)
+  const history = [...chat().messages, first.choices[0].message, { role: "user", content: "Second" }]
+  const second = await (await request(chat(history))).json()
+  expect(second.choices[0].message.content).toBe("Second answer")
+  expect(mock.creates).toBe(1)
+  expect(mock.sends).toBe(1)
 })
 
 test("a shorter committed answer keeps the stream that was already sent intact", async () => {
@@ -463,6 +606,15 @@ test("a shorter committed answer keeps the stream that was already sent intact",
   expect(text).toContain("Hello world, this is the provisional stream")
   expect(text).not.toContain('"error"')
   expect(text).toContain("[DONE]")
+})
+
+test("done text is exactly the assistant text already yielded to the client", async () => {
+  const events = await collect(transcriptEvents(iterable([
+    frame(message("Hello world, this is the provisional stream", 1, "provisional")),
+    frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+  ])))
+  const streamed = events.filter((event) => event.type === "text").map((event) => event.text).join("")
+  expect(events.at(-1)).toMatchObject({ type: "done", text: streamed })
 })
 
 test("a turn that ends without text is reported, not answered with nothing", async () => {

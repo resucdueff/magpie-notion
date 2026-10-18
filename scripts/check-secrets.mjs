@@ -8,13 +8,17 @@ import { fileURLToPath } from "node:url"
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
 const PATTERNS = [
   /token_v2=[A-Za-z0-9_%:.-]{20,}/,
-  /v02%3A[A-Za-z0-9_%:-]{16,}/,
+  /\bv0\d(?::|%3A)[A-Za-z0-9_%.:-]{16,}/,
   /\bsecret_[A-Za-z0-9]{24,}/,
   /\bntn_[A-Za-z0-9]{24,}/,
   /\bsk-[A-Za-z0-9]{24,}/,
 ]
 const IGNORE = new Set([".git", "node_modules", "dist", "coverage"])
 const MAX_BYTES = 2 * 1024 * 1024
+
+export function hasSecretShape(value) {
+  return PATTERNS.some((pattern) => pattern.test(value))
+}
 
 function* files(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -37,7 +41,7 @@ for (const path of files(ROOT)) {
   if (content.includes("\u0000")) continue
   const lines = content.split(/\r?\n/)
   lines.forEach((line, index) => {
-    if (PATTERNS.some((pattern) => pattern.test(line))) hits.push(`${relative(ROOT, path)}:${index + 1}`)
+    if (hasSecretShape(line)) hits.push(`${relative(ROOT, path)}:${index + 1}`)
   })
 }
 

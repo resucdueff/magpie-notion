@@ -1,17 +1,16 @@
-import { expect, test } from "bun:test"
+import { afterEach, expect, test } from "bun:test"
 import { execFile } from "node:child_process"
 import { createCipheriv, pbkdf2Sync, randomBytes } from "node:crypto"
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { createPlugin } from "../core.mjs"
-import protocol from "../protocol.mjs"
+import protocol, { _internal as protocolInternals } from "../protocol.mjs"
 import { SessionError, bestCookies, browserStores, cookieHeader, copyToTemporary, decryptValue, findDevtoolsSession, findSession, _internal } from "../session.mjs"
 
 const UUID = "11111111-1111-4111-8111-111111111111"
 const USER = "22222222-2222-4222-8222-222222222222"
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-const realFetch = globalThis.fetch
 const cookieValue = (header, name) => header.split(";").map((part) => part.trim()).find((part) => part.startsWith(name + "="))?.slice(name.length + 1)
 
 let sqlite
@@ -512,7 +511,7 @@ test("the only sign-in method is a Chinese token_v2 paste field", async () => {
 
 function mockNotion(handle) {
   const calls = []
-  globalThis.fetch = async (url, init) => {
+  protocolInternals.useFetch(async (url, init) => {
     const name = new URL(url).pathname.split("/").at(-1)
     calls.push({ name, data: JSON.parse(init.body), init })
     if (handle) { const custom = await handle(name, calls); if (custom) return custom }
@@ -522,9 +521,11 @@ function mockNotion(handle) {
     if (name === "getThreadTranscript") return Response.json({ type: "agent_service_transcript_page", patches: [], session: { sequence: 0, status: "running" }, forward_cursor: "cursor" })
     if (name === "listenToThreadTranscript") return new Response(JSON.stringify({ op: "put", entity: { id: "done", kind: "turn_completed", sequence: 1, stop_reason: "end_turn" } }) + "\n")
     throw new Error("Unexpected offline endpoint " + name)
-  }
+  })
   return { calls }
 }
+
+afterEach(() => { protocolInternals.useFetch(undefined) })
 
 async function chat(plugin, auth) {
   const loader = await plugin.auth.loader(async () => auth)
@@ -542,7 +543,6 @@ test("the pasted token is used directly and never reads a browser", async () => 
   expect(cookieValue(header, "token_v2")).toBe(auth.key)
   expect(UUID_PATTERN.test(cookieValue(header, "device_id"))).toBe(true)
   expect(cookieValue(header, "notion_users")).toBe(encodeURIComponent(JSON.stringify([USER])))
-  globalThis.fetch = realFetch
 })
 
 test.skipIf(!sqlite || process.platform !== "win32")("the Windows path reads a real DPAPI-sealed store end to end", async () => {
