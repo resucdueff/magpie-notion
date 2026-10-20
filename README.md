@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：1.0.2
+版本：1.0.3
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -71,3 +71,12 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 插件不执行客户端附带的工具。Codex 等代理每次请求都会带上工具定义；这些定义会被去掉，对话仍按纯文本发给 Notion，并返回文字回答。
 
 已经发生过的工具调用和工具结果会折成文字留在上下文里，Notion 不会再次执行它们。图片仍然拒绝。因此 Notion 模型可以正常对话，但不能替 Codex 运行 shell、改文件或调用其他工具。
+
+## 长上下文
+
+插件为 Notion personal-agent 线程采用约 44,000 token 的保守适配器安全窗口，这不是
+Notion 官方公布的上限。历史较长时，插件会完整保留 system/developer 指令和最新一条
+user 消息，从新到旧整条装入近期消息，并用明确的省略标记记录未发送的旧消息数量、
+估算 token 和 UTF-8 字节数。完整历史超过窗口后会改用有界近期历史新建线程；单条
+最新 user 消息本身超过窗口时，请求会在调用 Notion 前返回
+`context_length_exceeded`，此时请压缩过大的工具结果、缩短消息或新开会话。

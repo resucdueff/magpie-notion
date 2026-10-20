@@ -10,6 +10,7 @@ const TTL = 30 * 60 * 1000
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const moduleFetch = globalThis.fetch
 const CONTROL = /[\x00-\x1f\x7f]/
+const encoder = new TextEncoder()
 const READ_RETRIES = new Set([
   "getSpaces",
   "getAvailableModels",
@@ -20,6 +21,14 @@ const READ_RETRIES = new Set([
 ])
 const MAX_READ_RETRIES = 2
 const MAX_BACKWARD_PAGES = 8
+const MAX_ERROR_DETAIL_BYTES = 16 * 1024
+const TRANSCRIPT_PREAMBLE = "Conversation supplied by the client. Follow the system/developer instructions and answer the last user message."
+// These are conservative adapter safety windows, not Notion-published limits.
+// Personal-agent requests were observed failing near 51K tokens, so 44K leaves
+// room for server instructions, protocol framing and the model's response.
+const CONTEXT_BUDGET = 44_000
+const OUTPUT_BUDGET = 8192
+const ESTIMATED_BYTES_PER_TOKEN = 3
 let impitClient
 let impitLoading
 let fetchOverride
@@ -188,6 +197,15 @@ async function call(name, data, account, signal) {
     if (response.ok) return response
     const retryAfter = response.headers.get("Retry-After")?.trim()
     const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
+    if (response.status === 400 && ["createAgentThread", "sendEventToAgentThread"].includes(name)) {
+      // Read a bounded prefix only to classify the failure locally. The body is
+      // never logged or returned because it can contain account diagnostics.
+      const detail = await boundedBodyText(response, MAX_ERROR_DETAIL_BYTES)
+      const contextExceeded = /(?:context|length|size|too\s+long|too\s+large|maximum|exceed|too\s+many\s+tokens|token\s+limit)/i.test(detail)
+      throw contextExceeded
+        ? new ProviderError(400, "context_length_exceeded", "The Notion conversation context is too large. Compress earlier tool results, shorten the message, or start a new conversation.")
+        : new ProviderError(400, "notion_request_rejected", "Notion rejected the personal-agent request. Compress the conversation or start a new thread and try again.")
+    }
     await response.body?.cancel().catch(() => {})
     if (response.status === 429 && READ_RETRIES.has(name) && attempt < MAX_READ_RETRIES && Number.isSafeInteger(seconds) && seconds <= 5) {
       await wait(seconds * 1000, signal)
@@ -196,6 +214,37 @@ async function call(name, data, account, signal) {
     const code = response.status === 401 ? "session_expired" : response.status === 403 ? "workspace_forbidden" : response.status === 429 ? "rate_limited" : "upstream_http_error"
     throw new ProviderError(response.status, code, `Notion AI refused the request (HTTP ${response.status}).`, retryAfter ? { retryAfter } : undefined)
   }
+}
+
+async function boundedBodyText(response, limit) {
+  if (!response.body?.getReader) return ""
+  const reader = response.body.getReader()
+  const chunks = []
+  let bytes = 0
+  try {
+    while (bytes < limit) {
+      const next = await reader.read()
+      if (next.done) break
+      const room = limit - bytes
+      const chunk = next.value.length > room ? next.value.subarray(0, room) : next.value
+      chunks.push(chunk)
+      bytes += chunk.length
+      if (chunk.length < next.value.length) break
+    }
+  } catch {
+    // Classification falls back to the generic rejection when a body cannot
+    // be read; no upstream diagnostic is surfaced either way.
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+  const joined = new Uint8Array(bytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    joined.set(chunk, offset)
+    offset += chunk.length
+  }
+  return new TextDecoder().decode(joined)
 }
 
 const resolved = new Map()
@@ -311,8 +360,8 @@ function modelEntry(entry) {
     id: entry.model, providerID: "notion", name: entry.modelMessage,
     api: { id: entry.model, url: "https://notion.invalid/v1", npm: "@ai-sdk/openai-compatible" },
     status: "active", options: {}, headers: {},
-    // Zero denotes an unknown limit here, not an asserted vendor allowance.
-    limit: { context: 0, output: 0 },
+    // This is the adapter's safe working window, not a Notion-published limit.
+    limit: { context: CONTEXT_BUDGET, output: OUTPUT_BUDGET },
     capabilities: {
       temperature: false, reasoning: efforts.length > 0, attachment: false, toolcall: false,
       input: { text: true, image: false, audio: false, video: false, pdf: false },
@@ -322,9 +371,85 @@ function modelEntry(entry) {
   }
 }
 
-function initialText(messages) {
-  if (messages.length === 1 && messages[0].role === "user") return messages[0].content
-  return "Conversation supplied by the client. Follow the system/developer instructions and answer the last user message.\n\n" + messages.map((message) => `[${message.role}]\n${message.content}`).join("\n\n")
+function estimateTokens(value) {
+  return Math.ceil(encoder.encode(String(value)).length / ESTIMATED_BYTES_PER_TOKEN)
+}
+
+function formattedMessage(message) {
+  return `[${message.role}]\n${message.content}`
+}
+
+function transcriptText(messages, omission) {
+  if (!omission && messages.length === 1 && messages[0].role === "user") return messages[0].content
+  const body = messages.map(formattedMessage)
+  if (omission) body.unshift(omission)
+  return `${TRANSCRIPT_PREAMBLE}\n\n${body.join("\n\n")}`
+}
+
+function omissionText(messages) {
+  const formatted = messages.map(formattedMessage)
+  const tokens = formatted.reduce((sum, value) => sum + estimateTokens(value), 0)
+  const bytes = formatted.reduce((sum, value) => sum + encoder.encode(value).length, 0)
+  return `[Earlier history omitted / 早期历史已省略]\n${messages.length} earlier messages were omitted to fit the Magpie Notion adapter context budget (${tokens} estimated tokens, ${bytes} UTF-8 bytes).`
+}
+
+function contextLengthError(estimated, budget) {
+  return new ProviderError(
+    400,
+    "context_length_exceeded",
+    `The Notion request exceeds the adapter context budget (${estimated} > ${budget} estimated tokens). Compress earlier tool results, shorten the message, or start a new conversation.`,
+  )
+}
+
+// contextPlan keeps every system/developer instruction and the latest user
+// message, then fills from the newest history backward in whole messages. The
+// omission note is included in the same budget as the transcript it describes.
+function contextPlan(messages, budget = CONTEXT_BUDGET) {
+  if (!Array.isArray(messages) || !messages.length || messages.at(-1)?.role !== "user") {
+    throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
+  }
+  const fullText = transcriptText(messages)
+  const full = { tokens: estimateTokens(fullText), bytes: encoder.encode(fullText).length }
+  const protectedIndexes = new Set(messages.flatMap((message, index) => message.role === "system" || message.role === "developer" || index === messages.length - 1 ? [index] : []))
+  const candidates = messages.flatMap((_message, index) => protectedIndexes.has(index) ? [] : [index])
+
+  const render = (historyIndexes, omittedIndexes) => {
+    const selected = [...protectedIndexes, ...historyIndexes].sort((a, b) => a - b)
+    const omission = omittedIndexes.length ? omissionText(omittedIndexes.map((index) => messages[index])) : undefined
+    return transcriptText(selected.map((index) => messages[index]), omission)
+  }
+
+  const baseline = render([], candidates)
+  if (estimateTokens(baseline) > budget) throw contextLengthError(estimateTokens(baseline), budget)
+
+  let firstSelected = candidates.length
+  for (let index = candidates.length - 1; index >= 0; index--) {
+    const trial = render(candidates.slice(index), candidates.slice(0, index))
+    if (estimateTokens(trial) > budget) break
+    firstSelected = index
+  }
+
+  const selectedHistory = candidates.slice(firstSelected)
+  const omittedIndexes = candidates.slice(0, firstSelected)
+  const text = render(selectedHistory, omittedIndexes)
+  const estimated = { tokens: estimateTokens(text), bytes: encoder.encode(text).length }
+  if (estimated.tokens > budget) throw contextLengthError(estimated.tokens, budget)
+  const omittedFormatted = omittedIndexes.map((index) => formattedMessage(messages[index]))
+  return {
+    text,
+    messages: [...protectedIndexes, ...selectedHistory].sort((a, b) => a - b).map((index) => messages[index]),
+    full,
+    estimated,
+    budget,
+    fullOverBudget: full.tokens > budget,
+    omittedCount: omittedIndexes.length,
+    omittedTokens: omittedFormatted.reduce((sum, value) => sum + estimateTokens(value), 0),
+    omittedBytes: omittedFormatted.reduce((sum, value) => sum + encoder.encode(value).length, 0),
+  }
+}
+
+function initialText(messages, budget = CONTEXT_BUDGET) {
+  return contextPlan(messages, budget).text
 }
 
 function content(value) {
@@ -486,6 +611,11 @@ export default {
     return Object.fromEntries(entries.map((entry) => [entry.model, modelEntry(entry)]))
   },
   async open({ auth, chat, signal }) {
+    const last = chat.messages?.at(-1)
+    if (!last || last.role !== "user") throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
+    // Preflight the bounded transcript before auth/workspace/catalog access so
+    // an oversized latest message cannot consume a cached continuation.
+    const plan = contextPlan(chat.messages)
     const account = await accountOf(auth, signal)
     const models = await catalog(account, signal)
     const model = models.find((entry) => entry.model === chat.model)
@@ -494,12 +624,13 @@ export default {
     if (effort !== undefined && !model.modelConfiguration?.supportedReasoningEfforts?.includes(effort)) {
       throw new ProviderError(400, "reasoning_effort_unavailable", "The requested reasoning effort is not offered for this Notion model.")
     }
-    const last = chat.messages.at(-1)
-    if (last.role !== "user") throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
     const accountId = digest([account.cookie, account.spaceId, account.activeUserId, chat.model, effort])
     const historyKey = (messages) => digest([accountId, messages])
     const previousKey = historyKey(chat.messages.slice(0, -1))
-    let previous = take(previousKey)
+    // Once the complete client history is over budget, do not grow an old
+    // Notion thread. Rebuild a bounded recent window in a fresh thread; later
+    // oversized turns can slide that window and roll over again safely.
+    let previous = plan.fullOverBudget ? undefined : take(previousKey)
     let claimedKey = previous ? previousKey : undefined
     let afterSequence = 0
     if (previous) {
@@ -534,7 +665,7 @@ export default {
       const created = await json("createAgentThread", {
         type: "personal_agent", spaceId: account.spaceId, threadId,
         model: chat.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}),
-        createdSource: "full_page_chat", content: content(initialText(chat.messages)),
+        createdSource: "full_page_chat", content: content(plan.text),
         policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
         agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
         browserEnabled: false, clientMessageId: randomUUID(),
@@ -572,4 +703,28 @@ export default {
   usage: quota,
 }
 
-export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, useFetch }
+export const _internal = {
+  cookie,
+  credentials,
+  accountOf,
+  workspace,
+  resolved,
+  RESOLVED_TTL,
+  keepModels,
+  initialText,
+  contextPlan,
+  estimateTokens,
+  transcriptText,
+  content,
+  sessions,
+  catalogs,
+  eligible,
+  modelEntry,
+  percent,
+  rollingWindow,
+  billingWindow,
+  quotaWindows,
+  useFetch,
+  CONTEXT_BUDGET,
+  OUTPUT_BUDGET,
+}
