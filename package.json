@@ -1,6 +1,6 @@
 {
   "name": "magpie-notion",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Magpie / OpenCode 的 Notion AI 插件：登录时只粘贴自己的 token_v2，工作区自动发现。",
   "type": "module",
   "main": "./index.mjs",
@@ -9,6 +9,7 @@
   "scripts": {
     "check": "node check.mjs",
     "secrets": "node scripts/check-secrets.mjs",
+    "smoke:impit": "node --input-type=module -e \"const { Impit } = await import('impit'); new Impit({ browser: 'chrome' })\"",
     "test": "bun test"
   },
   "engines": {
