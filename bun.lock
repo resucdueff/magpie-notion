@@ -5,11 +5,14 @@
     "": {
       "name": "magpie-notion",
       "dependencies": {
+        "gpt-tokenizer": "4.1.0",
         "impit": "0.14.6",
       },
     },
   },
   "packages": {
+    "gpt-tokenizer": ["gpt-tokenizer@4.1.0", "", {}, "sha512-r7Op7S3iPy9vGpcfHmfIlLN/+/mNL2kXDy3N/ppp2xC2pm57pyYTt3fqsncMZ/yfIT+d3mTGhd7H6fcF/qiqWg=="],
+
     "impit": ["impit@0.14.6", "", { "optionalDependencies": { "impit-darwin-arm64": "0.14.6", "impit-darwin-x64": "0.14.6", "impit-linux-arm64-gnu": "0.14.6", "impit-linux-arm64-musl": "0.14.6", "impit-linux-x64-gnu": "0.14.6", "impit-linux-x64-musl": "0.14.6", "impit-win32-arm64-msvc": "0.14.6", "impit-win32-x64-msvc": "0.14.6" } }, "sha512-1i5DxW0eRIUCtX9x+ZCSzD+FlRiEdrDOXazg0DYNMKUgnVwRWEwRhbA23Lpo2WOC674wZpwTQUubBi5z7m04Ng=="],
 
     "impit-darwin-arm64": ["impit-darwin-arm64@0.14.6", "", { "os": "darwin", "cpu": "arm64" }, "sha512-QhEENTXA727SlgIIIfPg4Ij2FEgwX/3rKCBpR84JxZZfQVVNO/KB2cVvt9aupokY1NZIo6oBFYJXF5PKyRVKbQ=="],
