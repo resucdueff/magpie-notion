@@ -9,6 +9,7 @@
   "scripts": {
     "check": "node check.mjs",
     "secrets": "node scripts/check-secrets.mjs",
+    "smoke:impit": "node --input-type=module -e \"const { Impit } = await import('impit'); new Impit({ browser: 'chrome' })\"",
     "test": "bun test"
   },
   "engines": {

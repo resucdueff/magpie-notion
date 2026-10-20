@@ -75,8 +75,10 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 ## 长上下文
 
 插件为 Notion personal-agent 线程采用约 44,000 token 的保守适配器安全窗口，这不是
-Notion 官方公布的上限。历史较长时，插件会完整保留 system/developer 指令和最新一条
-user 消息，从新到旧整条装入近期消息，并用明确的省略标记记录未发送的旧消息数量、
-估算 token 和 UTF-8 字节数。完整历史超过窗口后会改用有界近期历史新建线程；单条
-最新 user 消息本身超过窗口时，请求会在调用 Notion 前返回
-`context_length_exceeded`，此时请压缩过大的工具结果、缩短消息或新开会话。
+Notion 官方公布的上限。实际发送前另以 44,000 UTF-8 bytes 作为不会低估的硬上限；
+token 数只用于显示，不参与放行判断。历史较长时，插件会完整保留 system/developer
+指令和最新一条 user 消息，从新到旧整条装入近期消息，并用明确的省略标记记录未发送
+的旧消息数量、估算 token 和 UTF-8 字节数。完整历史超过窗口后改用有界近期历史新建
+线程，并允许后续轮次续写该有界线程。system/developer 指令或单条最新 user 消息本身
+超过硬上限时，请求会在调用 Notion 前返回 `context_length_exceeded`，错误信息会说明
+是系统指令还是最新消息过长；此时请缩短对应内容或新开会话。
