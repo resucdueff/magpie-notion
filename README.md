@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：1.0.4
+版本：1.0.5
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -74,11 +74,19 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 
 ## 长上下文
 
-模型目录中的 `limit.context` 是 **40,000 token** 的保守安全窗口。插件使用随依赖
-安装的纯 JavaScript `gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用
-网络 API，也不会在运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的
-限制；Notion 的私有 tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K
-的边界低约 11K，而不是把 40K 当成官方上限。
+插件内部使用 **40,000 token** 的保守安全窗口。它使用随依赖安装的纯 JavaScript
+`gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用网络 API，也不会在
+运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的限制；Notion 的私有
+tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K 的边界低约 11K，而不是
+把 40K 当成官方上限。
+
+为了避开 Magpie / OpenCode 与 `cl100k_base` 不一致的 token 估算，模型目录会显式
+发布 `limit.context = 2,097,152`。这个值是 2 MiB 传输上限对应的**宿主守卫值**，
+不是 Notion 或任何 AI 模型的真实上下文窗口，也不代表模型能处理 200 万 token。
+它让宿主不会在插件之前误拒插件本来接受的请求，同时保留 `limit.output = 8192`，
+并阻止 models.dev 用与 Notion 无关的窗口回填。请求能否进入 Notion 仍由插件的
+**40,000 token `cl100k_base` 安全窗口**、`sentTokens` rollover 和 2 MiB 传输限制
+决定；真正超过 40K 时会在调用 Notion 前明确返回 `context_length_exceeded`。
 
 历史较长时，插件会完整保留 system/developer 指令和最新一条 user 消息，从新到旧
 整条装入近期消息，省略标记本身也计入 token 预算。完整历史首次超过窗口后会改用有界

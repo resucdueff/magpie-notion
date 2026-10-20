@@ -115,13 +115,25 @@ afterEach(() => {
   internals.useFetch(undefined)
 })
 
-test("models publish a tokenized 40K adapter window and an 8K output window", () => {
+test("models publish an explicit 2 MiB host guard and keep the 40K adapter window local", () => {
   expect(internals.CONTEXT_BUDGET).toBe(40_000)
   expect(internals.THREAD_TOKEN_BUDGET).toBe(40_000)
   expect(internals.TURN_OVERHEAD_TOKENS).toBe(256)
   expect(internals.MAX_INPUT_BYTES).toBe(2 * 1024 * 1024)
+  expect(internals.HOST_CONTEXT_GUARD).toBe(2_097_152)
   expect(internals.OUTPUT_BUDGET).toBe(8192)
-  expect(internals.modelEntry(model).limit).toEqual({ context: 40_000, output: 8192 })
+  expect(internals.modelEntry(model).limit).toEqual({ context: 2_097_152, output: 8192 })
+})
+
+test("the models() catalog retains both limit fields through the host mapping", async () => {
+  const mock = mockNotion()
+  const catalog = await protocol.models({ auth })
+  const published = catalog[model.model]
+  expect(published.limit).toEqual({ context: 2_097_152, output: 8192 })
+  const context = published.limit.context
+  const mapped = context > 0 ? { context, output: Math.min(published.limit.output, context) } : undefined
+  expect(mapped).toEqual({ context: 2_097_152, output: 8192 })
+  expect(mock.calls.map((call) => call.name)).toEqual(["authValidate", "getAvailableModels"])
 })
 
 test("a 46,831-byte natural-language system prompt is accepted", async () => {
@@ -138,6 +150,43 @@ test("a 46,831-byte natural-language system prompt is accepted", async () => {
   expect(created).toContain(system)
   expect(created).toContain("Reply with OK")
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
+})
+
+test("a 39.5K cl100k natural-language request reaches upstream despite the host byte estimate", async () => {
+  const mock = mockNotion()
+  const sentence = "Notwithstanding extraordinarily comprehensive internationalization considerations, the administration conscientiously documented interdisciplinary responsibilities and environmental sustainability outcomes. "
+  const tail = " This final sentence confirms the review is complete after all interdisciplinary considerations were documented and communicated to the administration."
+  const content = sentence.repeat(1_973) + tail
+  expect(tokens(content)).toBe(39_481)
+  expect(tokens(content)).toBeLessThan(40_000)
+  expect(Math.floor(internals.utf8Bytes(content) / 4)).toBeGreaterThan(100_000)
+
+  const response = await request(chat([{ role: "user", content }]))
+  expect(response.status).toBe(200)
+  expect(mock.creates).toBe(1)
+  const created = mock.calls.find((call) => call.name === "createAgentThread").data.content[0].text[0][0]
+  expect(created).toBe(content)
+})
+
+test("the host guard covers every body the adapter can admit, even at one token per byte", () => {
+  const guard = internals.HOST_CONTEXT_GUARD
+  expect(guard).toBe(internals.MAX_INPUT_BYTES)
+  expect(guard).toBeGreaterThanOrEqual(internals.MAX_INPUT_BYTES)
+  expect(Math.floor(internals.MAX_INPUT_BYTES / 4)).toBeLessThan(guard)
+  // The reported production estimate (57,361 for ~39.5K cl100k) fits the
+  // same guard with more than 36 times the headroom.
+  expect(57_361).toBeLessThan(guard)
+})
+
+test("the published model limit survives Magpie/OpenCode normalization with both fields", () => {
+  const published = internals.modelEntry(model)
+  const normalize = (m) => ({
+    context: m.limit?.context ?? 0,
+    output: m.limit?.output ?? 0,
+  })
+  expect(normalize(published)).toEqual({ context: 2_097_152, output: 8192 })
+  expect(normalize(published).context).toBeGreaterThan(57_361)
+  expect(normalize(published).output).toBe(8192)
 })
 
 test("a Codex-style system and developer transcript is accepted in the token budget", async () => {
@@ -157,7 +206,7 @@ test("a Codex-style system and developer transcript is accepted in the token bud
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
 })
 
-test("70K Base64 and 132K hex latest messages are rejected before any upstream call", async () => {
+test("70K Base64 and 132K hex latest messages are rejected locally before any upstream call", async () => {
   const mock = mockNotion()
   const values = [
     dense(70_000, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),

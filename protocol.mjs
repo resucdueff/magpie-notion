@@ -33,6 +33,11 @@ const THREAD_TOKEN_BUDGET = CONTEXT_BUDGET
 const TURN_OVERHEAD_TOKENS = 256
 // This is a transport/DoS ceiling, not a context-window decision.
 const MAX_INPUT_BYTES = 2 * 1024 * 1024
+// This is a host preflight guard, not a Notion or AI-model context window.
+// Magpie/OpenCode may count tokens differently from cl100k. At the transport
+// ceiling even one token per UTF-8 byte must remain within the host window;
+// the adapter's real 40K cl100k gate and sentTokens rollover stay local.
+const HOST_CONTEXT_GUARD = MAX_INPUT_BYTES
 let impitClient
 let impitLoading
 let fetchOverride
@@ -364,9 +369,10 @@ function modelEntry(entry) {
     id: entry.model, providerID: "notion", name: entry.modelMessage,
     api: { id: entry.model, url: "https://notion.invalid/v1", npm: "@ai-sdk/openai-compatible" },
     status: "active", options: {}, headers: {},
-    // Magpie reads limit.context as token metadata. The send gate uses the
-    // same conservative token window; neither value is a Notion limit.
-    limit: { context: CONTEXT_BUDGET, output: OUTPUT_BUDGET },
+    // Publish an explicit host guard so Magpie forwards both values to
+    // OpenCode and models.dev cannot backfill a smaller window. This is not
+    // the model's real window; the adapter enforces 40K cl100k locally.
+    limit: { context: HOST_CONTEXT_GUARD, output: OUTPUT_BUDGET },
     capabilities: {
       temperature: false, reasoning: efforts.length > 0, attachment: false, toolcall: false,
       input: { text: true, image: false, audio: false, video: false, pdf: false },
@@ -834,5 +840,6 @@ export const _internal = {
   THREAD_TOKEN_BUDGET,
   TURN_OVERHEAD_TOKENS,
   MAX_INPUT_BYTES,
+  HOST_CONTEXT_GUARD,
   OUTPUT_BUDGET,
 }
