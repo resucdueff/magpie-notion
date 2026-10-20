@@ -28,6 +28,9 @@ function mockNotion(options = {}) {
   let creates = 0
   let sends = 0
   let committedSequence = 0
+  const threadBytes = new Map()
+  const answerSize = options.answerSize ?? 0
+  const overLimitSends = []
   internals.useFetch(async (url, init) => {
     const name = new URL(url).pathname.split("/").at(-1)
     const data = JSON.parse(init.body)
@@ -40,9 +43,13 @@ function mockNotion(options = {}) {
     if (name === "getAvailableModels") return Response.json({ models: [model] })
     if (name === "createAgentThread") {
       creates++
+      threadBytes.set(data.threadId, internals.utf8Bytes(data.content[0].text[0][0]) + internals.TURN_OVERHEAD_BYTES)
       return Response.json({ threadId: data.threadId })
     }
     if (name === "sendEventToAgentThread") {
+      const next = (threadBytes.get(data.threadId) ?? 0) + internals.utf8Bytes(data.event.content[0].text[0][0]) + internals.TURN_OVERHEAD_BYTES
+      if (next > internals.THREAD_BYTE_BUDGET) overLimitSends.push(next)
+      threadBytes.set(data.threadId, next)
       sends++
       return Response.json({})
     }
@@ -54,11 +61,22 @@ function mockNotion(options = {}) {
       const answerSequence = committedSequence + 1
       const doneSequence = committedSequence + 2
       committedSequence = doneSequence
-      return ndjson([frame(answer(continued ? "Continued answer" : "First answer", answerSequence), done(doneSequence))])
+      const text = (continued ? "Continued answer" : "First answer") + "a".repeat(answerSize)
+      const prior = threadBytes.get(data.threadId) ?? 0
+      const next = prior + internals.utf8Bytes(text)
+      if (next > internals.THREAD_BYTE_BUDGET) overLimitSends.push(next)
+      threadBytes.set(data.threadId, next)
+      return ndjson([frame(answer(text, answerSequence), done(doneSequence))])
     }
     throw new Error("Unexpected offline endpoint " + name)
   })
-  return { calls, get creates() { return creates }, get sends() { return sends } }
+  return {
+    calls,
+    threadBytes,
+    overLimitSends,
+    get creates() { return creates },
+    get sends() { return sends },
+  }
 }
 
 async function request(body) {
@@ -94,6 +112,8 @@ afterEach(() => {
 test("models publish the conservative adapter context and output windows", () => {
   expect(internals.CONTEXT_BUDGET).toBe(44_000)
   expect(internals.CONTEXT_BYTE_BUDGET).toBe(44_000)
+  expect(internals.THREAD_BYTE_BUDGET).toBe(44_000)
+  expect(internals.TURN_OVERHEAD_BYTES).toBe(256)
   expect(internals.OUTPUT_BUDGET).toBe(8192)
   expect(internals.modelEntry(model).limit).toEqual({ context: 44_000, output: 8192 })
 })
@@ -208,6 +228,34 @@ test("oversized system instructions have a distinct protected-budget error", () 
   expect(failure.message).not.toContain("tool results")
 })
 
+test("system and latest user each fit but their combined baseline has its own error", () => {
+  const messages = [
+    { role: "system", content: "s".repeat(30_000) },
+    { role: "user", content: "u".repeat(20_000) },
+  ]
+  expect(internals.utf8Bytes(messages[0].content)).toBeLessThan(internals.CONTEXT_BYTE_BUDGET)
+  expect(internals.utf8Bytes(messages[1].content)).toBeLessThan(internals.CONTEXT_BYTE_BUDGET)
+  let failure
+  try {
+    internals.contextPlan(messages)
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toMatchObject({ status: 400, code: "context_length_exceeded" })
+  expect(failure.message).toContain("together")
+  expect(failure.message).toContain("system/developer instructions")
+  expect(failure.message).toContain("latest user message")
+  expect(failure.message).not.toContain("The latest user message exceeds")
+})
+
+test("cumulative thread accounting admits the exact byte boundary and rolls over above it", () => {
+  const incoming = "x".repeat(1_000)
+  const admittedAt = internals.THREAD_BYTE_BUDGET - internals.utf8Bytes(incoming) - internals.TURN_OVERHEAD_BYTES
+  expect(internals.threadTurnBytes(admittedAt, incoming)).toBe(internals.THREAD_BYTE_BUDGET)
+  expect(internals.threadTurnBytes(admittedAt + 1, incoming)).toBeUndefined()
+  expect(internals.threadTurnBytes(undefined, incoming)).toBeUndefined()
+})
+
 test("a full-over-budget bounded thread is continued on the next full-history turn", async () => {
   const mock = mockNotion({ continueThread: true })
   const history = []
@@ -264,6 +312,55 @@ test("a large but bounded rollover continues instead of recreating on the follow
     expect(mock.creates).toBe(createsBefore)
     expect(mock.sends).toBe(sendsBefore + 1)
   }
+})
+
+test("five rounds continue within the cumulative budget and then roll over without an oversized send", async () => {
+  const mock = mockNotion({ continueThread: true, answerSize: 0 })
+  const fixed = [
+    { role: "system", content: "PINNED-SYSTEM" },
+    { role: "user", content: "Start" },
+  ]
+  let history = [...fixed]
+  let body
+  const createdPrefixes = []
+  const outcomes = []
+  for (let round = 0; round < 5; round++) {
+    history = [...history, { role: "user", content: `turn-${round}-` + "q".repeat(10_000) }]
+    const createsBefore = mock.creates
+    const sendsBefore = mock.sends
+    const response = await request(chat(history))
+    body = await response.json()
+    expect(response.status).toBe(200)
+    history = [...history, body.choices[0].message]
+    if (mock.creates > createsBefore) {
+      expect(mock.sends).toBe(sendsBefore)
+      outcomes.push("create")
+      createdPrefixes.push(mock.calls.filter((call) => call.name === "createAgentThread").at(-1).data.content[0].text[0][0])
+    } else {
+      expect(mock.sends).toBe(sendsBefore + 1)
+      outcomes.push("send")
+    }
+  }
+  expect(outcomes.slice(0, 4)).toEqual(["create", "send", "send", "send"])
+  expect(outcomes.at(-1)).toBe("create")
+  expect(mock.overLimitSends).toEqual([])
+  expect(createdPrefixes.length).toBe(mock.creates)
+  for (const text of createdPrefixes) {
+    expect(internals.utf8Bytes(text)).toBeLessThanOrEqual(internals.CONTEXT_BYTE_BUDGET)
+    expect(text).toContain("PINNED-SYSTEM")
+  }
+  expect(body.choices[0].message.content).toContain("answer")
+})
+
+test("a cache record without cumulative byte accounting is never continued", async () => {
+  const mock = mockNotion({ continueThread: true })
+  const initial = await firstTurn()
+  for (const value of internals.sessions.values()) delete value.sentBytes
+  const response = await request(chat([...initial, { role: "user", content: "Second" }]))
+  expect(response.status).toBe(200)
+  expect(mock.sends).toBe(0)
+  expect(mock.creates).toBe(2)
+  expect(internals.sessions.size).toBe(1)
 })
 
 test("an oversized latest user neither calls upstream nor consumes a cached continuation", async () => {

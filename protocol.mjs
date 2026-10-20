@@ -30,6 +30,8 @@ const TRANSCRIPT_PREAMBLE = "Conversation supplied by the client. Follow the sys
 const CONTEXT_BUDGET = 44_000
 const OUTPUT_BUDGET = 8192
 const CONTEXT_BYTE_BUDGET = 44_000
+const THREAD_BYTE_BUDGET = 44_000
+const TURN_OVERHEAD_BYTES = 256
 const TOKEN_ESTIMATE_BYTES = 3
 let impitClient
 let impitLoading
@@ -362,7 +364,8 @@ function modelEntry(entry) {
     id: entry.model, providerID: "notion", name: entry.modelMessage,
     api: { id: entry.model, url: "https://notion.invalid/v1", npm: "@ai-sdk/openai-compatible" },
     status: "active", options: {}, headers: {},
-    // This is the adapter's safe working window, not a Notion-published limit.
+    // Magpie reads limit.context as token metadata. The send gate is the
+    // independent UTF-8 byte budget below; neither value is a Notion limit.
     limit: { context: CONTEXT_BUDGET, output: OUTPUT_BUDGET },
     capabilities: {
       temperature: false, reasoning: efforts.length > 0, attachment: false, toolcall: false,
@@ -400,14 +403,20 @@ function omissionText(messages) {
 }
 
 function contextLengthError(estimated, budget, kind = "history") {
-  const subject = kind === "protected" ? "The protected system/developer instructions" : kind === "latest"
-    ? "The latest user message"
-    : "The Notion request"
+  const subject = kind === "protected"
+    ? "The protected system/developer instructions"
+    : kind === "latest"
+      ? "The latest user message"
+      : kind === "combined"
+        ? "The protected system/developer instructions and the latest user message together"
+        : "The Notion request"
   const guidance = kind === "latest"
     ? "Shorten the latest user message or start a new conversation."
     : kind === "protected"
       ? "Shorten the system/developer instructions or start a new conversation."
-      : "Compress earlier tool results, shorten the message, or start a new conversation."
+      : kind === "combined"
+        ? "Shorten the system/developer instructions, shorten the latest user message, or start a new conversation."
+        : "Compress earlier tool results, shorten the message, or start a new conversation."
   return new ProviderError(
     400,
     "context_length_exceeded",
@@ -436,10 +445,11 @@ function contextPlan(messages, budget = CONTEXT_BYTE_BUDGET) {
   const baseline = render([], candidates)
   if (utf8Bytes(baseline) > budget) {
     const instructions = messages.filter((message) => message.role === "system" || message.role === "developer")
-    if (instructions.length && utf8Bytes(transcriptText(instructions)) > budget) {
-      throw contextLengthError(utf8Bytes(transcriptText(instructions)), budget, "protected")
-    }
-    throw contextLengthError(utf8Bytes(baseline), budget, "latest")
+    const instructionBytes = instructions.length ? utf8Bytes(transcriptText(instructions)) : 0
+    const latestBytes = utf8Bytes(transcriptText([messages.at(-1)]))
+    if (instructionBytes > budget) throw contextLengthError(instructionBytes, budget, "protected")
+    if (latestBytes > budget) throw contextLengthError(latestBytes, budget, "latest")
+    throw contextLengthError(utf8Bytes(baseline), budget, "combined")
   }
 
   let firstSelected = candidates.length
@@ -500,16 +510,29 @@ function forget(key) {
   claims.delete(key)
 }
 
-function remember(key, threadId, sequence, bounded = false) {
+function remember(key, threadId, sequence, bounded, sentBytes) {
   while (sessions.size >= 256) sessions.delete(sessions.keys().next().value)
-  sessions.set(key, { threadId, sequence, bounded, at: Date.now() })
+  sessions.set(key, { threadId, sequence, bounded, sentBytes, at: Date.now() })
+}
+
+function threadTurnBytes(sentBytes, incoming) {
+  if (!Number.isSafeInteger(sentBytes) || sentBytes < 0) return undefined
+  const projected = sentBytes + utf8Bytes(incoming) + TURN_OVERHEAD_BYTES
+  return projected <= THREAD_BYTE_BUDGET ? projected : undefined
 }
 
 function takeMatching(messages, accountId) {
+  const incoming = messages.at(-1)?.content
   for (let count = messages.length; count > 0; count--) {
     const key = digest([accountId, messages.slice(0, count)])
     const value = sessions.get(key)
-    if (!value?.bounded || claims.has(key)) continue
+    if (!value?.bounded) continue
+    if (!Number.isSafeInteger(value.sentBytes) || value.sentBytes < 0) {
+      sessions.delete(key)
+      claims.delete(key)
+      continue
+    }
+    if (threadTurnBytes(value.sentBytes, incoming) === undefined || claims.has(key)) continue
     claims.add(key)
     return { key, value }
   }
@@ -663,19 +686,38 @@ export default {
     // oversized turns can slide that window and roll over again safely.
     let previous = take(previousKey)
     let previousEntryKey = previousKey
+    let continuedBytes
+    if (previous && !Number.isSafeInteger(previous.sentBytes)) {
+      forget(previousEntryKey)
+      previous = undefined
+    }
+    if (previous) {
+      continuedBytes = threadTurnBytes(previous.sentBytes, last.content)
+      if (continuedBytes === undefined) {
+        // The remote thread is at its cumulative budget. Never probe or send to
+        // it first: rebuild from the bounded client history in a fresh thread.
+        forget(previousEntryKey)
+        previous = undefined
+      }
+    }
     if (plan.fullOverBudget) {
       if (previous && !previous.bounded) {
         release(previousEntryKey)
         previous = undefined
+        continuedBytes = undefined
       }
       if (!previous) {
         const boundedPrevious = takeMatching(chat.messages, accountId)
         previous = boundedPrevious?.value
-        if (boundedPrevious) previousEntryKey = boundedPrevious.key
+        if (boundedPrevious) {
+          previousEntryKey = boundedPrevious.key
+          continuedBytes = threadTurnBytes(previous.sentBytes, last.content)
+        }
       }
     }
     let claimedKey = previous ? previousEntryKey : undefined
     let bounded = previous?.bounded ?? plan.fullOverBudget
+    let sentBytes = previous ? continuedBytes : plan.estimated.bytes + TURN_OVERHEAD_BYTES
     let afterSequence = 0
     if (previous) {
       try {
@@ -717,6 +759,7 @@ export default {
       if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
       threadId = created.threadId
       bounded = plan.fullOverBudget
+      sentBytes = plan.estimated.bytes + TURN_OVERHEAD_BYTES
     }
     const pages = await transcriptPages(account, threadId, afterSequence, signal)
     const newest = pages.at(-1)
@@ -739,7 +782,10 @@ export default {
       try {
         for await (const event of transcriptEvents(frames(), signal, { afterSequence })) {
           if (event.type === "text") answer += event.text
-          else if (event.type === "done") remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence, bounded)
+          else if (event.type === "done") {
+            const completedBytes = sentBytes + utf8Bytes(answer)
+            remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence, bounded, completedBytes)
+          }
           yield event
         }
       } finally { await liveResponse?.body?.cancel().catch(() => {}) }
@@ -766,6 +812,7 @@ export const _internal = {
   catalogs,
   eligible,
   modelEntry,
+  threadTurnBytes,
   percent,
   rollingWindow,
   billingWindow,
@@ -773,5 +820,7 @@ export const _internal = {
   useFetch,
   CONTEXT_BUDGET,
   CONTEXT_BYTE_BUDGET,
+  THREAD_BYTE_BUDGET,
+  TURN_OVERHEAD_BYTES,
   OUTPUT_BUDGET,
 }
