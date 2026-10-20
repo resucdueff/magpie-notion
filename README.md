@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：1.0.3
+版本：1.0.4
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -74,18 +74,19 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 
 ## 长上下文
 
-模型目录中的 `limit.context` 是 **44,000 token** 的保守安全元数据窗口，用于告诉
-Magpie 这个适配器的可用上下文规模；这不是 Notion 官方公布的上限，也不等于实际的
-字节门限。真正发送前另以 **44,000 UTF-8 bytes** 作为不会低估的硬上限，token 估算
-只用于显示，不参与放行判断。
+模型目录中的 `limit.context` 是 **40,000 token** 的保守安全窗口。插件使用随依赖
+安装的纯 JavaScript `gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用
+网络 API，也不会在运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的
+限制；Notion 的私有 tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K
+的边界低约 11K，而不是把 40K 当成官方上限。
 
 历史较长时，插件会完整保留 system/developer 指令和最新一条 user 消息，从新到旧
-整条装入近期消息，并用明确的省略标记记录未发送的旧消息数量、估算 token 和 UTF-8
-字节数。完整历史首次超过窗口后会改用有界近期历史新建线程，后续轮次优先续写该线程；
-每个远端线程还会累计已发送的用户消息、assistant 回答和每轮保守协议开销，累计达到
-44,000 bytes 时不再向其发送，而是用当前客户端历史重新生成本地有界上下文并自动
-建立新线程。
+整条装入近期消息，省略标记本身也计入 token 预算。完整历史首次超过窗口后会改用有界
+近期历史新建线程，后续轮次优先续写该线程；每个远端线程累计
+`initialPlan.tokens + user/assistant tokens + 256 token 余量`，到 40,000 token 前
+主动重新生成有界上下文并 rollover，不先发送一个已知超限的请求。另设 2 MB UTF-8
+输入上限，只用于防止异常大请求消耗资源，不作为正常上下文判断。
 
-system/developer 指令单独超过硬上限、最新 user 单独超过硬上限，或两者分别未超限
-但合在一起超限时，请求都会在调用 Notion 前返回 `context_length_exceeded`，错误
-信息会分别说明原因；请缩短对应内容或新开会话。
+system/developer 指令单独超过 token 上限、最新 user 单独超过 token 上限，或两者
+分别未超限但合在一起超限时，请求都会在调用 Notion 前返回
+`context_length_exceeded`，错误信息会分别说明原因；请缩短对应内容或新开会话。

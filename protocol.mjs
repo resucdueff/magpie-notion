@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
+import { countTokens } from "gpt-tokenizer/encoding/cl100k_base"
 import { ProviderError } from "./core.mjs"
 import { readNDJSON, transcriptEvents, sessionError } from "./transcript.mjs"
 
@@ -24,15 +25,14 @@ const MAX_BACKWARD_PAGES = 8
 const MAX_ERROR_DETAIL_BYTES = 16 * 1024
 const TRANSCRIPT_PREAMBLE = "Conversation supplied by the client. Follow the system/developer instructions and answer the last user message."
 // These are conservative adapter safety windows, not Notion-published limits.
-// The observed ~51K-token failure boundary contains about 48.7K UTF-8 bytes for
-// dense ASCII, so the byte ceiling stays below that even when tokenizer
-// metadata is inaccurate. CONTEXT_BUDGET remains display-only metadata.
-const CONTEXT_BUDGET = 44_000
+// cl100k_base is only an approximation of Notion's private tokenizer, so the
+// 40K window leaves roughly 11K tokens beneath the observed ~51K failure edge.
+const CONTEXT_BUDGET = 40_000
 const OUTPUT_BUDGET = 8192
-const CONTEXT_BYTE_BUDGET = 44_000
-const THREAD_BYTE_BUDGET = 44_000
-const TURN_OVERHEAD_BYTES = 256
-const TOKEN_ESTIMATE_BYTES = 3
+const THREAD_TOKEN_BUDGET = CONTEXT_BUDGET
+const TURN_OVERHEAD_TOKENS = 256
+// This is a transport/DoS ceiling, not a context-window decision.
+const MAX_INPUT_BYTES = 2 * 1024 * 1024
 let impitClient
 let impitLoading
 let fetchOverride
@@ -364,8 +364,8 @@ function modelEntry(entry) {
     id: entry.model, providerID: "notion", name: entry.modelMessage,
     api: { id: entry.model, url: "https://notion.invalid/v1", npm: "@ai-sdk/openai-compatible" },
     status: "active", options: {}, headers: {},
-    // Magpie reads limit.context as token metadata. The send gate is the
-    // independent UTF-8 byte budget below; neither value is a Notion limit.
+    // Magpie reads limit.context as token metadata. The send gate uses the
+    // same conservative token window; neither value is a Notion limit.
     limit: { context: CONTEXT_BUDGET, output: OUTPUT_BUDGET },
     capabilities: {
       temperature: false, reasoning: efforts.length > 0, attachment: false, toolcall: false,
@@ -376,8 +376,14 @@ function modelEntry(entry) {
   }
 }
 
+function tokenCount(value) {
+  // Allow literal special-token spellings in ordinary user content. We only
+  // need their cost, not their semantic role in a model prompt.
+  return countTokens(String(value), { allowedSpecial: "all" })
+}
+
 function estimateTokens(value) {
-  return Math.ceil(utf8Bytes(value) / TOKEN_ESTIMATE_BYTES)
+  return tokenCount(value)
 }
 
 function utf8Bytes(value) {
@@ -397,12 +403,12 @@ function transcriptText(messages, omission) {
 
 function omissionText(messages) {
   const formatted = messages.map(formattedMessage)
-  const tokens = formatted.reduce((sum, value) => sum + estimateTokens(value), 0)
+  const tokens = formatted.reduce((sum, value) => sum + tokenCount(value), 0)
   const bytes = formatted.reduce((sum, value) => sum + utf8Bytes(value), 0)
-  return `[Earlier history omitted / 早期历史已省略]\n${messages.length} earlier messages were omitted to fit the Magpie Notion adapter context budget (${tokens} estimated tokens, ${bytes} UTF-8 bytes).`
+  return `[Earlier history omitted / 早期历史已省略]\n${messages.length} earlier messages were omitted to fit the Magpie Notion adapter context budget (${tokens} tokens, ${bytes} UTF-8 bytes).`
 }
 
-function contextLengthError(estimated, budget, kind = "history") {
+function contextLengthError(tokens, budget, kind = "history") {
   const subject = kind === "protected"
     ? "The protected system/developer instructions"
     : kind === "latest"
@@ -420,19 +426,24 @@ function contextLengthError(estimated, budget, kind = "history") {
   return new ProviderError(
     400,
     "context_length_exceeded",
-    `${subject} exceeds the adapter context byte budget (${estimated} > ${budget} UTF-8 bytes). ${guidance}`,
+    `${subject} exceeds the adapter context token budget (${tokens} > ${budget} tokens). ${guidance}`,
   )
 }
 
 // contextPlan keeps every system/developer instruction and the latest user
-// message, then fills from the newest history backward in whole messages. The
-// omission note is included in the same budget as the transcript it describes.
-function contextPlan(messages, budget = CONTEXT_BYTE_BUDGET) {
+// message, then fills from the newest history backward in whole messages under
+// a real cl100k_base token count. The omission note is counted as part of the
+// transcript it describes.
+function contextPlan(messages, budget = CONTEXT_BUDGET) {
   if (!Array.isArray(messages) || !messages.length || messages.at(-1)?.role !== "user") {
     throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
   }
   const fullText = transcriptText(messages)
-  const full = { tokens: estimateTokens(fullText), bytes: utf8Bytes(fullText) }
+  const fullBytes = utf8Bytes(fullText)
+  if (fullBytes > MAX_INPUT_BYTES) {
+    throw new ProviderError(413, "request_too_large", "The request exceeds the adapter's 2 MB transport safety limit.")
+  }
+  const full = { tokens: tokenCount(fullText), bytes: fullBytes }
   const protectedIndexes = new Set(messages.flatMap((message, index) => message.role === "system" || message.role === "developer" || index === messages.length - 1 ? [index] : []))
   const candidates = messages.flatMap((_message, index) => protectedIndexes.has(index) ? [] : [index])
 
@@ -443,27 +454,27 @@ function contextPlan(messages, budget = CONTEXT_BYTE_BUDGET) {
   }
 
   const baseline = render([], candidates)
-  if (utf8Bytes(baseline) > budget) {
+  if (tokenCount(baseline) > budget) {
     const instructions = messages.filter((message) => message.role === "system" || message.role === "developer")
-    const instructionBytes = instructions.length ? utf8Bytes(transcriptText(instructions)) : 0
-    const latestBytes = utf8Bytes(transcriptText([messages.at(-1)]))
-    if (instructionBytes > budget) throw contextLengthError(instructionBytes, budget, "protected")
-    if (latestBytes > budget) throw contextLengthError(latestBytes, budget, "latest")
-    throw contextLengthError(utf8Bytes(baseline), budget, "combined")
+    const instructionTokens = instructions.length ? tokenCount(transcriptText(instructions)) : 0
+    const latestTokens = tokenCount(transcriptText([messages.at(-1)]))
+    if (instructionTokens > budget) throw contextLengthError(instructionTokens, budget, "protected")
+    if (latestTokens > budget) throw contextLengthError(latestTokens, budget, "latest")
+    throw contextLengthError(tokenCount(baseline), budget, "combined")
   }
 
   let firstSelected = candidates.length
   for (let index = candidates.length - 1; index >= 0; index--) {
     const trial = render(candidates.slice(index), candidates.slice(0, index))
-    if (utf8Bytes(trial) > budget) break
+    if (tokenCount(trial) > budget) break
     firstSelected = index
   }
 
   const selectedHistory = candidates.slice(firstSelected)
   const omittedIndexes = candidates.slice(0, firstSelected)
   const text = render(selectedHistory, omittedIndexes)
-  const estimated = { tokens: estimateTokens(text), bytes: utf8Bytes(text) }
-  if (estimated.bytes > budget) throw contextLengthError(estimated.bytes, budget, "history")
+  const estimated = { tokens: tokenCount(text), bytes: utf8Bytes(text) }
+  if (estimated.tokens > budget) throw contextLengthError(estimated.tokens, budget, "history")
   const omittedFormatted = omittedIndexes.map((index) => formattedMessage(messages[index]))
   return {
     text,
@@ -471,14 +482,14 @@ function contextPlan(messages, budget = CONTEXT_BYTE_BUDGET) {
     full,
     estimated,
     budget,
-    fullOverBudget: full.bytes > budget,
+    fullOverBudget: full.tokens > budget,
     omittedCount: omittedIndexes.length,
-    omittedTokens: omittedFormatted.reduce((sum, value) => sum + estimateTokens(value), 0),
+    omittedTokens: omittedFormatted.reduce((sum, value) => sum + tokenCount(value), 0),
     omittedBytes: omittedFormatted.reduce((sum, value) => sum + utf8Bytes(value), 0),
   }
 }
 
-function initialText(messages, budget = CONTEXT_BYTE_BUDGET) {
+function initialText(messages, budget = CONTEXT_BUDGET) {
   return contextPlan(messages, budget).text
 }
 
@@ -510,15 +521,15 @@ function forget(key) {
   claims.delete(key)
 }
 
-function remember(key, threadId, sequence, bounded, sentBytes) {
+function remember(key, threadId, sequence, bounded, sentTokens) {
   while (sessions.size >= 256) sessions.delete(sessions.keys().next().value)
-  sessions.set(key, { threadId, sequence, bounded, sentBytes, at: Date.now() })
+  sessions.set(key, { threadId, sequence, bounded, sentTokens, at: Date.now() })
 }
 
-function threadTurnBytes(sentBytes, incoming) {
-  if (!Number.isSafeInteger(sentBytes) || sentBytes < 0) return undefined
-  const projected = sentBytes + utf8Bytes(incoming) + TURN_OVERHEAD_BYTES
-  return projected <= THREAD_BYTE_BUDGET ? projected : undefined
+function threadTurnTokens(sentTokens, incoming) {
+  if (!Number.isSafeInteger(sentTokens) || sentTokens < 0) return undefined
+  const projected = sentTokens + tokenCount(incoming)
+  return projected <= THREAD_TOKEN_BUDGET ? projected : undefined
 }
 
 function takeMatching(messages, accountId) {
@@ -527,12 +538,12 @@ function takeMatching(messages, accountId) {
     const key = digest([accountId, messages.slice(0, count)])
     const value = sessions.get(key)
     if (!value?.bounded) continue
-    if (!Number.isSafeInteger(value.sentBytes) || value.sentBytes < 0) {
+    if (!Number.isSafeInteger(value.sentTokens) || value.sentTokens < 0) {
       sessions.delete(key)
       claims.delete(key)
       continue
     }
-    if (threadTurnBytes(value.sentBytes, incoming) === undefined || claims.has(key)) continue
+    if (threadTurnTokens(value.sentTokens, incoming) === undefined || claims.has(key)) continue
     claims.add(key)
     return { key, value }
   }
@@ -686,14 +697,14 @@ export default {
     // oversized turns can slide that window and roll over again safely.
     let previous = take(previousKey)
     let previousEntryKey = previousKey
-    let continuedBytes
-    if (previous && !Number.isSafeInteger(previous.sentBytes)) {
+    let continuedTokens
+    if (previous && !Number.isSafeInteger(previous.sentTokens)) {
       forget(previousEntryKey)
       previous = undefined
     }
     if (previous) {
-      continuedBytes = threadTurnBytes(previous.sentBytes, last.content)
-      if (continuedBytes === undefined) {
+      continuedTokens = threadTurnTokens(previous.sentTokens, last.content)
+      if (continuedTokens === undefined) {
         // The remote thread is at its cumulative budget. Never probe or send to
         // it first: rebuild from the bounded client history in a fresh thread.
         forget(previousEntryKey)
@@ -704,20 +715,20 @@ export default {
       if (previous && !previous.bounded) {
         release(previousEntryKey)
         previous = undefined
-        continuedBytes = undefined
+        continuedTokens = undefined
       }
       if (!previous) {
         const boundedPrevious = takeMatching(chat.messages, accountId)
         previous = boundedPrevious?.value
         if (boundedPrevious) {
           previousEntryKey = boundedPrevious.key
-          continuedBytes = threadTurnBytes(previous.sentBytes, last.content)
+          continuedTokens = threadTurnTokens(previous.sentTokens, last.content)
         }
       }
     }
     let claimedKey = previous ? previousEntryKey : undefined
     let bounded = previous?.bounded ?? plan.fullOverBudget
-    let sentBytes = previous ? continuedBytes : plan.estimated.bytes + TURN_OVERHEAD_BYTES
+    let sentTokens = previous ? continuedTokens : plan.estimated.tokens + TURN_OVERHEAD_TOKENS
     let afterSequence = 0
     if (previous) {
       try {
@@ -759,7 +770,7 @@ export default {
       if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
       threadId = created.threadId
       bounded = plan.fullOverBudget
-      sentBytes = plan.estimated.bytes + TURN_OVERHEAD_BYTES
+      sentTokens = plan.estimated.tokens + TURN_OVERHEAD_TOKENS
     }
     const pages = await transcriptPages(account, threadId, afterSequence, signal)
     const newest = pages.at(-1)
@@ -783,8 +794,8 @@ export default {
         for await (const event of transcriptEvents(frames(), signal, { afterSequence })) {
           if (event.type === "text") answer += event.text
           else if (event.type === "done") {
-            const completedBytes = sentBytes + utf8Bytes(answer)
-            remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence, bounded, completedBytes)
+            const completedTokens = sentTokens + tokenCount(answer)
+            remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence, bounded, completedTokens)
           }
           yield event
         }
@@ -805,6 +816,7 @@ export const _internal = {
   initialText,
   contextPlan,
   estimateTokens,
+  tokenCount,
   utf8Bytes,
   transcriptText,
   content,
@@ -812,15 +824,15 @@ export const _internal = {
   catalogs,
   eligible,
   modelEntry,
-  threadTurnBytes,
+  threadTurnTokens,
   percent,
   rollingWindow,
   billingWindow,
   quotaWindows,
   useFetch,
   CONTEXT_BUDGET,
-  CONTEXT_BYTE_BUDGET,
-  THREAD_BYTE_BUDGET,
-  TURN_OVERHEAD_BYTES,
+  THREAD_TOKEN_BUDGET,
+  TURN_OVERHEAD_TOKENS,
+  MAX_INPUT_BYTES,
   OUTPUT_BUDGET,
 }

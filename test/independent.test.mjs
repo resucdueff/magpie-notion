@@ -474,7 +474,7 @@ test("package entry exports only the plugin and all declared runtime files exist
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url)))
   const plugin = await NotionPlugin()
   expect(Object.keys(await import("../index.mjs"))).toEqual(["NotionPlugin"])
-  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.3" })
+  expect(pkg).toMatchObject({ name: "magpie-notion", version: "1.0.4" })
   expect(pkg.description).toContain("token_v2")
   expect(plugin.auth.provider).toBe("notion")
   expect(plugin.auth.methods).toEqual([{ type: "api", label: "粘贴 token_v2", placeholder: "只粘贴 token_v2" }])
