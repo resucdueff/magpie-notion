@@ -115,13 +115,15 @@ afterEach(() => {
   internals.useFetch(undefined)
 })
 
-test("models publish a tokenized 40K adapter window and an 8K output window", () => {
+test("models keep the 40K adapter window local and publish only the 8K output budget", () => {
   expect(internals.CONTEXT_BUDGET).toBe(40_000)
   expect(internals.THREAD_TOKEN_BUDGET).toBe(40_000)
   expect(internals.TURN_OVERHEAD_TOKENS).toBe(256)
   expect(internals.MAX_INPUT_BYTES).toBe(2 * 1024 * 1024)
   expect(internals.OUTPUT_BUDGET).toBe(8192)
-  expect(internals.modelEntry(model).limit).toEqual({ context: 40_000, output: 8192 })
+  const limit = internals.modelEntry(model).limit
+  expect(limit.context).toBeUndefined()
+  expect(limit).toEqual({ output: 8192 })
 })
 
 test("a 46,831-byte natural-language system prompt is accepted", async () => {
@@ -138,6 +140,22 @@ test("a 46,831-byte natural-language system prompt is accepted", async () => {
   expect(created).toContain(system)
   expect(created).toContain("Reply with OK")
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
+})
+
+test("a 39.5K cl100k natural-language request reaches upstream despite the host byte estimate", async () => {
+  const mock = mockNotion()
+  const sentence = "Notwithstanding extraordinarily comprehensive internationalization considerations, the administration conscientiously documented interdisciplinary responsibilities and environmental sustainability outcomes. "
+  const tail = " This final sentence confirms the review is complete after all interdisciplinary considerations were documented and communicated to the administration."
+  const content = sentence.repeat(1_973) + tail
+  expect(tokens(content)).toBe(39_481)
+  expect(tokens(content)).toBeLessThan(40_000)
+  expect(Math.floor(internals.utf8Bytes(content) / 4)).toBeGreaterThan(100_000)
+
+  const response = await request(chat([{ role: "user", content }]))
+  expect(response.status).toBe(200)
+  expect(mock.creates).toBe(1)
+  const created = mock.calls.find((call) => call.name === "createAgentThread").data.content[0].text[0][0]
+  expect(created).toBe(content)
 })
 
 test("a Codex-style system and developer transcript is accepted in the token budget", async () => {
@@ -157,7 +175,7 @@ test("a Codex-style system and developer transcript is accepted in the token bud
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
 })
 
-test("70K Base64 and 132K hex latest messages are rejected before any upstream call", async () => {
+test("70K Base64 and 132K hex latest messages are rejected locally before any upstream call", async () => {
   const mock = mockNotion()
   const values = [
     dense(70_000, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"),

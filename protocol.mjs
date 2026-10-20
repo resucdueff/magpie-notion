@@ -364,9 +364,11 @@ function modelEntry(entry) {
     id: entry.model, providerID: "notion", name: entry.modelMessage,
     api: { id: entry.model, url: "https://notion.invalid/v1", npm: "@ai-sdk/openai-compatible" },
     status: "active", options: {}, headers: {},
-    // Magpie reads limit.context as token metadata. The send gate uses the
-    // same conservative token window; neither value is a Notion limit.
-    limit: { context: CONTEXT_BUDGET, output: OUTPUT_BUDGET },
+    // Magpie only gives OpenCode a context window when this is published.
+    // Its tokenizer can estimate ordinary text very differently from cl100k,
+    // so the adapter's 40K safety budget must not become a host preflight
+    // limit. The output budget remains useful metadata.
+    limit: { output: OUTPUT_BUDGET },
     capabilities: {
       temperature: false, reasoning: efforts.length > 0, attachment: false, toolcall: false,
       input: { text: true, image: false, audio: false, video: false, pdf: false },

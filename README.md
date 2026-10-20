@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：1.0.4
+版本：1.0.5
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -74,11 +74,16 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 
 ## 长上下文
 
-模型目录中的 `limit.context` 是 **40,000 token** 的保守安全窗口。插件使用随依赖
-安装的纯 JavaScript `gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用
-网络 API，也不会在运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的
-限制；Notion 的私有 tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K
-的边界低约 11K，而不是把 40K 当成官方上限。
+插件内部使用 **40,000 token** 的保守安全窗口。它使用随依赖安装的纯 JavaScript
+`gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用网络 API，也不会在
+运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的限制；Notion 的私有
+tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K 的边界低约 11K，而不是
+把 40K 当成官方上限。
+
+插件不发布 `limit.context`。Magpie / OpenCode 的宿主 token 估算可能与 `cl100k_base`
+不同，若把 40K 作为宿主预检上限，正常请求可能在到达插件前就被误判超限。上下文仍由
+插件按 cl100k 在本地检查；真正超过 40K 时会在调用 Notion 前明确返回
+`context_length_exceeded`。
 
 历史较长时，插件会完整保留 system/developer 指令和最新一条 user 消息，从新到旧
 整条装入近期消息，省略标记本身也计入 token 预算。完整历史首次超过窗口后会改用有界
