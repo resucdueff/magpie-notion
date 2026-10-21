@@ -28,6 +28,16 @@ const prose = (bytes) => {
   return seed.repeat(Math.ceil(bytes / seed.length)).slice(0, bytes)
 }
 const dense = (length, alphabet) => Array.from({ length }, (_, index) => alphabet[(index * 17 + 11) % alphabet.length]).join("")
+const pseudoBase64 = (length) => {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  let state = 1
+  let value = ""
+  for (let index = 0; index < length; index++) {
+    state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0
+    value += alphabet[(state >>> 24) & 63]
+  }
+  return value
+}
 
 function mockNotion(options = {}) {
   const calls = []
@@ -119,6 +129,8 @@ test("models publish an explicit 2 MiB host guard and keep the 40K adapter windo
   expect(internals.CONTEXT_BUDGET).toBe(40_000)
   expect(internals.THREAD_TOKEN_BUDGET).toBe(40_000)
   expect(internals.TURN_OVERHEAD_TOKENS).toBe(256)
+  expect(internals.MAX_UPSTREAM_TEXT_BYTES).toBe(200_000)
+  expect(internals.MAX_UPSTREAM_BODY_BYTES).toBe(203_500)
   expect(internals.MAX_INPUT_BYTES).toBe(2 * 1024 * 1024)
   expect(internals.HOST_CONTEXT_GUARD).toBe(2_097_152)
   expect(internals.OUTPUT_BUDGET).toBe(8192)
@@ -152,20 +164,33 @@ test("a 46,831-byte natural-language system prompt is accepted", async () => {
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
 })
 
-test("a 39.5K cl100k natural-language request reaches upstream despite the host byte estimate", async () => {
+test("a 56.8 KB Base64 request under both gates reaches upstream", async () => {
   const mock = mockNotion()
-  const sentence = "Notwithstanding extraordinarily comprehensive internationalization considerations, the administration conscientiously documented interdisciplinary responsibilities and environmental sustainability outcomes. "
-  const tail = " This final sentence confirms the review is complete after all interdisciplinary considerations were documented and communicated to the administration."
-  const content = sentence.repeat(1_973) + tail
-  expect(tokens(content)).toBe(39_481)
+  const content = dense(56_800, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+  expect(internals.utf8Bytes(content)).toBe(56_800)
   expect(tokens(content)).toBeLessThan(40_000)
-  expect(Math.floor(internals.utf8Bytes(content) / 4)).toBeGreaterThan(100_000)
 
   const response = await request(chat([{ role: "user", content }]))
   expect(response.status).toBe(200)
   expect(mock.creates).toBe(1)
   const created = mock.calls.find((call) => call.name === "createAgentThread").data.content[0].text[0][0]
   expect(created).toBe(content)
+  const sent = mock.calls.find((call) => call.name === "createAgentThread").init.body
+  expect(internals.utf8Bytes(sent)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_BODY_BYTES)
+})
+
+test("a 56.9 KB Base64 request above the token gate is rejected before upstream", async () => {
+  const mock = mockNotion()
+  const content = pseudoBase64(56_900)
+  expect(internals.utf8Bytes(content)).toBe(56_900)
+  expect(tokens(content)).toBeGreaterThan(internals.CONTEXT_BUDGET)
+  const response = await request(chat([{ role: "user", content }]))
+  expect(response.status).toBe(400)
+  const body = await response.json()
+  expect(body.error.code).toBe("context_length_exceeded")
+  expect(body.error.message).toContain("latest user message")
+  expect(body.error.message).toContain("token budget")
+  expect(mock.calls).toHaveLength(0)
 })
 
 test("the host guard covers every body the adapter can admit, even at one token per byte", () => {
@@ -256,21 +281,44 @@ test("Chinese and emoji history is counted with the real tokenizer and omitted s
   expect(plan.text).not.toContain("\uFFFD")
 })
 
-test("the exact 40,000-token boundary is admitted and 40,001 is rejected", async () => {
-  const admitted = " hello".repeat(40_000)
-  const rejected = " hello".repeat(40_001)
-  expect(tokens(admitted)).toBe(40_000)
-  expect(tokens(rejected)).toBe(40_001)
+test("whole-message selection obeys the byte gate even when the token gate has room", () => {
+  const oldUser = "a".repeat(180_000)
+  const oldAnswer = "a".repeat(20_000)
+  const plan = internals.contextPlan([
+    { role: "user", content: oldUser },
+    { role: "assistant", content: oldAnswer },
+    { role: "user", content: "latest" },
+  ])
+  expect(plan.full.tokens).toBeLessThan(internals.CONTEXT_BUDGET)
+  expect(plan.full.bytes).toBeGreaterThan(internals.MAX_UPSTREAM_TEXT_BYTES)
+  expect(plan.fullOverBudget).toBe(true)
+  expect(plan.omittedCount).toBe(1)
+  expect(plan.estimated.bytes).toBeLessThanOrEqual(internals.MAX_UPSTREAM_TEXT_BYTES)
+  expect(plan.text).toContain("latest")
+  expect(plan.text).toContain(oldAnswer)
+  expect(plan.text).not.toContain(oldUser)
+  expect(plan.text).toContain("[Earlier history omitted /")
+})
+
+test("the exact 200,000-byte text boundary is admitted and larger latest messages are rejected", async () => {
+  const admitted = "a".repeat(internals.MAX_UPSTREAM_TEXT_BYTES)
+  expect(internals.utf8Bytes(admitted)).toBe(200_000)
+  expect(tokens(admitted)).toBe(25_000)
   const plan = internals.contextPlan([{ role: "user", content: admitted }])
-  expect(plan.estimated.tokens).toBe(40_000)
+  expect(plan.estimated).toEqual({ tokens: 25_000, bytes: 200_000 })
 
   const mock = mockNotion()
   expect((await request(chat([{ role: "user", content: admitted }]))).status).toBe(200)
-  const callsBefore = mock.calls.length
-  const failure = await request(chat([{ role: "user", content: rejected }]))
-  expect(failure.status).toBe(400)
-  expect((await failure.json()).error.message).toContain("latest user message")
-  expect(mock.calls).toHaveLength(callsBefore)
+  for (const length of [200_001, 204_250]) {
+    const callsBefore = mock.calls.length
+    const failure = await request(chat([{ role: "user", content: "a".repeat(length) }]))
+    expect(failure.status).toBe(400)
+    const body = await failure.json()
+    expect(body.error.code).toBe("context_length_exceeded")
+    expect(body.error.message).toContain("latest user message")
+    expect(body.error.message).toContain("UTF-8 bytes")
+    expect(mock.calls).toHaveLength(callsBefore)
+  }
 })
 
 test("protected, latest and combined context failures are attributed separately before upstream", async () => {
@@ -303,6 +351,40 @@ test("protected, latest and combined context failures are attributed separately 
     expect(body.error.message).toContain(item.phrase)
     expect(body.error.message).toContain("token budget")
     expect(body.error.message).not.toContain("UTF-8 bytes")
+  }
+  expect(mock.calls).toHaveLength(0)
+})
+
+test("protected, latest and combined UTF-8 byte failures are attributed separately before upstream", async () => {
+  const mock = mockNotion()
+  const cases = [
+    {
+      messages: [
+        { role: "system", content: "a".repeat(200_001) },
+        { role: "user", content: "latest" },
+      ],
+      phrase: "protected system/developer instructions",
+    },
+    {
+      messages: [{ role: "user", content: "a".repeat(200_001) }],
+      phrase: "latest user message",
+    },
+    {
+      messages: [
+        { role: "system", content: "a".repeat(100_001) },
+        { role: "user", content: "a".repeat(100_001) },
+      ],
+      phrase: "together",
+    },
+  ]
+  for (const item of cases) {
+    const response = await request(chat(item.messages))
+    expect(response.status).toBe(400)
+    const body = await response.json()
+    expect(body.error.code).toBe("context_length_exceeded")
+    expect(body.error.message).toContain(item.phrase)
+    expect(body.error.message).toContain("UTF-8 bytes")
+    expect(body.error.message).not.toContain("token budget")
   }
   expect(mock.calls).toHaveLength(0)
 })
@@ -466,6 +548,40 @@ test("a large historical tool result is omitted while the latest user is retaine
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
 })
 
+test("JSON escaping that expands a safe transcript past the body limit fails locally", async () => {
+  const mock = mockNotion()
+  const content = "\n".repeat(120_000)
+  expect(internals.utf8Bytes(content)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_TEXT_BYTES)
+  expect(tokens(content)).toBeLessThan(internals.CONTEXT_BUDGET)
+  const response = await request(chat([{ role: "user", content }]))
+  expect(response.status).toBe(413)
+  const body = await response.json()
+  expect(body.error.code).toBe("request_too_large")
+  expect(body.error.message).toContain("UTF-8 bytes")
+  expect(mock.calls).toHaveLength(0)
+})
+
+test("an oversized encoded continuation fails before claiming the cached thread", async () => {
+  const mock = mockNotion()
+  const initial = await firstTurn()
+  expect(internals.sessions.size).toBe(1)
+  const callsBefore = mock.calls.length
+  const expanded = "\n".repeat(120_000)
+  expect(tokens(expanded)).toBeLessThan(internals.CONTEXT_BUDGET)
+
+  const rejected = await request(chat([...initial, { role: "user", content: expanded }]))
+  expect(rejected.status).toBe(413)
+  expect((await rejected.json()).error.code).toBe("request_too_large")
+  expect(mock.calls).toHaveLength(callsBefore)
+  expect(internals.sessions.size).toBe(1)
+
+  const retried = await request(chat([...initial, { role: "user", content: "Second" }]))
+  expect(retried.status).toBe(200)
+  expect((await retried.json()).choices[0].message.content).toBe("Continued answer")
+  expect(mock.creates).toBe(1)
+  expect(mock.sends).toBe(1)
+})
+
 test("the 2 MB transport ceiling rejects an otherwise untokenizable request before upstream", async () => {
   const mock = mockNotion()
   const response = await request(chat([{ role: "user", content: "x".repeat(internals.MAX_INPUT_BYTES + 1) }]))
@@ -477,21 +593,22 @@ test("the 2 MB transport ceiling rejects an otherwise untokenizable request befo
 })
 
 test.each([
-  ["maximum context length exceeded", "context_length_exceeded"],
-  ["context window is full", "context_length_exceeded"],
-  ["too many tokens in prompt", "context_length_exceeded"],
-  ["personal agent rejected this request", "notion_request_rejected"],
-  ["field length exceeds its maximum", "notion_request_rejected"],
-  ["maximum size is 12", "notion_request_rejected"],
-])("thread creation HTTP 400 is classified locally without exposing its body: %s", async (message, code) => {
+  ["maximum context length exceeded", "context_length_exceeded", 400],
+  ["context window is full", "context_length_exceeded", 400],
+  ["too many tokens in prompt", "context_length_exceeded", 422],
+  ["personal agent rejected this request", "notion_request_rejected", 400],
+  ["request body too large", "request_too_large", 413],
+  ["field length exceeds its maximum", "request_too_large", 400],
+  ["maximum size is 12", "request_too_large", 422],
+])("thread creation HTTP size/context errors are classified locally without exposing their body: %s", async (message, code, status) => {
   const mock = mockNotion({
     handle: (name) => name === "createAgentThread"
-      ? Response.json({ message, private_diagnostic: "upstream-private-account-data" }, { status: 400 })
+      ? Response.json({ message, private_diagnostic: "upstream-private-account-data" }, { status })
       : undefined,
   })
   const response = await request(chat([{ role: "user", content: "Hello" }]))
   const body = await response.text()
-  expect(response.status).toBe(400)
+  expect(response.status).toBe(status)
   expect(body).toContain(code)
   expect(body).not.toContain("upstream-private-account-data")
   expect(mock.creates).toBe(0)

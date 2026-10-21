@@ -25,13 +25,19 @@ const MAX_BACKWARD_PAGES = 8
 const MAX_ERROR_DETAIL_BYTES = 16 * 1024
 const TRANSCRIPT_PREAMBLE = "Conversation supplied by the client. Follow the system/developer instructions and answer the last user message."
 // These are conservative adapter safety windows, not Notion-published limits.
-// cl100k_base is only an approximation of Notion's private tokenizer, so the
-// 40K window leaves roughly 11K tokens beneath the observed ~51K failure edge.
+// cl100k_base is only an approximation of Notion's private tokenizer. The older
+// "~51K tokens" figure was actually UTF-8 bytes / 4, not token evidence.
 const CONTEXT_BUDGET = 40_000
 const OUTPUT_BUDGET = 8192
 const THREAD_TOKEN_BUDGET = CONTEXT_BUDGET
 const TURN_OVERHEAD_TOKENS = 256
-// This is a transport/DoS ceiling, not a context-window decision.
+// Notion's web endpoint has been measured rejecting a createAgentThread body
+// around 204.2 KB. That is an observed internal boundary, not a published
+// Notion limit. Keep both a conservative transcript window and a separate
+// final-JSON guard so a safe transcript can be selected before serialization.
+const MAX_UPSTREAM_TEXT_BYTES = 200_000
+const MAX_UPSTREAM_BODY_BYTES = 203_500
+// This is an incoming transport/DoS ceiling, not a context-window decision.
 const MAX_INPUT_BYTES = 2 * 1024 * 1024
 // This is a host preflight guard, not a Notion or AI-model context window.
 // Magpie/OpenCode may count tokens differently from cl100k. At the transport
@@ -184,7 +190,32 @@ function credentials(auth) {
   return { cookie: key, spaceId, activeUserId }
 }
 
+function upstreamBodyBytes(data) {
+  return utf8Bytes(JSON.stringify(data))
+}
+
+function assertUpstreamBodySize(name, data) {
+  if (!["createAgentThread", "sendEventToAgentThread"].includes(name)) return
+  const bytes = upstreamBodyBytes(data)
+  if (bytes <= MAX_UPSTREAM_BODY_BYTES) return
+  throw new ProviderError(
+    413,
+    "request_too_large",
+    `The encoded Notion request body exceeds the adapter safety limit (${bytes} > ${MAX_UPSTREAM_BODY_BYTES} UTF-8 bytes). Shorten the message or start a new conversation.`,
+  )
+}
+
+function sizeFailure(detail) {
+  return /(?:request|body|payload)[\s_-]*(?:is[\s_-]*)?(?:too[\s_-]*large|size[\s_-]*(?:limit[\s_-]*)?exceed(?:s|ed)?)|(?:field|content|message|transcript)[\s_-]*(?:(?:length|size)[\s_-]*(?:exceed(?:s|ed)?|is[\s_-]*too[\s_-]*(?:large|long))|(?:is[\s_-]*)?too[\s_-]*(?:large|long))|(?:maximum|max|allowed)[\s_-]*(?:field|request|body|content|message|transcript)?[\s_-]*size|size[\s_-]*exceeds?[\s_-]*(?:the[\s_-]*)?(?:maximum|limit)/i.test(detail)
+}
+
+function tokenFailure(detail) {
+  return /(?:context[\s_-]*(?:length|window|limit)|(?:maximum|max)[\s_-]*context|too\s+many\s+tokens|token[\s_-]*(?:limit|budget)|input[\s_-]*(?:too\s+long|length)|prompt[\s_-]*(?:too\s+long|length))/i.test(detail)
+}
+
 async function call(name, data, account, signal) {
+  assertUpstreamBodySize(name, data)
+  const body = JSON.stringify(data)
   const headers = {
     Accept: name === "listenToThreadTranscript" ? "application/x-ndjson" : "application/json",
     "Content-Type": "application/json",
@@ -201,19 +232,22 @@ async function call(name, data, account, signal) {
     const response = await request(name, `${ORIGIN}/api/v3/${name}`, {
       method: "POST",
       headers,
-      body: JSON.stringify(data), signal, redirect: "error",
+      body, signal, redirect: "error",
     })
     if (response.ok) return response
     const retryAfter = response.headers.get("Retry-After")?.trim()
     const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
-    if (response.status === 400 && ["createAgentThread", "sendEventToAgentThread"].includes(name)) {
+    if ([400, 413, 422].includes(response.status) && ["createAgentThread", "sendEventToAgentThread"].includes(name)) {
       // Read a bounded prefix only to classify the failure locally. The body is
       // never logged or returned because it can contain account diagnostics.
       const detail = await boundedBodyText(response, MAX_ERROR_DETAIL_BYTES)
-      const contextExceeded = /(?:context[\s_-]*(?:length|window|limit)|(?:maximum|max)[\s_-]*context|too\s+many\s+tokens|input[\s_-]*(?:too\s+long|length)|prompt[\s_-]*(?:too\s+long|length))/i.test(detail)
-      throw contextExceeded
-        ? new ProviderError(400, "context_length_exceeded", "The Notion conversation context is too large. Compress earlier tool results, shorten the message, or start a new conversation.")
-        : new ProviderError(400, "notion_request_rejected", "Notion rejected the personal-agent request. Compress the conversation or start a new thread and try again.")
+      if (response.status === 413 || sizeFailure(detail)) {
+        throw new ProviderError(response.status, "request_too_large", "Notion rejected the request body as too large. Shorten the message or start a new conversation.")
+      }
+      if (tokenFailure(detail)) {
+        throw new ProviderError(response.status, "context_length_exceeded", "The Notion conversation context is too large. Compress earlier tool results, shorten the message, or start a new conversation.")
+      }
+      throw new ProviderError(response.status, "notion_request_rejected", "Notion rejected the personal-agent request. Compress the conversation or start a new thread and try again.")
     }
     await response.body?.cancel().catch(() => {})
     if (response.status === 429 && READ_RETRIES.has(name) && attempt < MAX_READ_RETRIES && Number.isSafeInteger(seconds) && seconds <= 5) {
@@ -414,7 +448,7 @@ function omissionText(messages) {
   return `[Earlier history omitted / 早期历史已省略]\n${messages.length} earlier messages were omitted to fit the Magpie Notion adapter context budget (${tokens} tokens, ${bytes} UTF-8 bytes).`
 }
 
-function contextLengthError(tokens, budget, kind = "history") {
+function contextLengthError(value, budget, unit, kind = "history") {
   const subject = kind === "protected"
     ? "The protected system/developer instructions"
     : kind === "latest"
@@ -429,18 +463,20 @@ function contextLengthError(tokens, budget, kind = "history") {
       : kind === "combined"
         ? "Shorten the system/developer instructions, shorten the latest user message, or start a new conversation."
         : "Compress earlier tool results, shorten the message, or start a new conversation."
+  const measured = unit === "bytes" ? `${value} > ${budget} UTF-8 bytes` : `${value} > ${budget} tokens`
+  const label = unit === "bytes" ? "context UTF-8 byte budget" : "context token budget"
   return new ProviderError(
     400,
     "context_length_exceeded",
-    `${subject} exceeds the adapter context token budget (${tokens} > ${budget} tokens). ${guidance}`,
+    `${subject} exceeds the adapter ${label} (${measured}). ${guidance}`,
   )
 }
 
 // contextPlan keeps every system/developer instruction and the latest user
 // message, then fills from the newest history backward in whole messages under
-// a real cl100k_base token count. The omission note is counted as part of the
-// transcript it describes.
-function contextPlan(messages, budget = CONTEXT_BUDGET) {
+// both a real cl100k_base token count and a conservative UTF-8 transcript byte
+// window. The omission note is counted as part of the transcript it describes.
+function contextPlan(messages, budget = CONTEXT_BUDGET, byteBudget = MAX_UPSTREAM_TEXT_BYTES) {
   if (!Array.isArray(messages) || !messages.length || messages.at(-1)?.role !== "user") {
     throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
   }
@@ -449,7 +485,9 @@ function contextPlan(messages, budget = CONTEXT_BUDGET) {
   if (fullBytes > MAX_INPUT_BYTES) {
     throw new ProviderError(413, "request_too_large", "The request exceeds the adapter's 2 MB transport safety limit.")
   }
-  const full = { tokens: tokenCount(fullText), bytes: fullBytes }
+  const measure = (value) => ({ tokens: tokenCount(value), bytes: utf8Bytes(value) })
+  const over = (value) => value.tokens > budget || value.bytes > byteBudget
+  const full = measure(fullText)
   const protectedIndexes = new Set(messages.flatMap((message, index) => message.role === "system" || message.role === "developer" || index === messages.length - 1 ? [index] : []))
   const candidates = messages.flatMap((_message, index) => protectedIndexes.has(index) ? [] : [index])
 
@@ -460,27 +498,32 @@ function contextPlan(messages, budget = CONTEXT_BUDGET) {
   }
 
   const baseline = render([], candidates)
-  if (tokenCount(baseline) > budget) {
+  const baselineUsage = measure(baseline)
+  if (over(baselineUsage)) {
     const instructions = messages.filter((message) => message.role === "system" || message.role === "developer")
-    const instructionTokens = instructions.length ? tokenCount(transcriptText(instructions)) : 0
-    const latestTokens = tokenCount(transcriptText([messages.at(-1)]))
-    if (instructionTokens > budget) throw contextLengthError(instructionTokens, budget, "protected")
-    if (latestTokens > budget) throw contextLengthError(latestTokens, budget, "latest")
-    throw contextLengthError(tokenCount(baseline), budget, "combined")
+    const instructionUsage = instructions.length ? measure(transcriptText(instructions)) : { tokens: 0, bytes: 0 }
+    const latestUsage = measure(transcriptText([messages.at(-1)]))
+    if (instructionUsage.tokens > budget) throw contextLengthError(instructionUsage.tokens, budget, "tokens", "protected")
+    if (instructionUsage.bytes > byteBudget) throw contextLengthError(instructionUsage.bytes, byteBudget, "bytes", "protected")
+    if (latestUsage.tokens > budget) throw contextLengthError(latestUsage.tokens, budget, "tokens", "latest")
+    if (latestUsage.bytes > byteBudget) throw contextLengthError(latestUsage.bytes, byteBudget, "bytes", "latest")
+    if (baselineUsage.tokens > budget) throw contextLengthError(baselineUsage.tokens, budget, "tokens", "combined")
+    throw contextLengthError(baselineUsage.bytes, byteBudget, "bytes", "combined")
   }
 
   let firstSelected = candidates.length
   for (let index = candidates.length - 1; index >= 0; index--) {
     const trial = render(candidates.slice(index), candidates.slice(0, index))
-    if (tokenCount(trial) > budget) break
+    if (over(measure(trial))) break
     firstSelected = index
   }
 
   const selectedHistory = candidates.slice(firstSelected)
   const omittedIndexes = candidates.slice(0, firstSelected)
   const text = render(selectedHistory, omittedIndexes)
-  const estimated = { tokens: tokenCount(text), bytes: utf8Bytes(text) }
-  if (estimated.tokens > budget) throw contextLengthError(estimated.tokens, budget, "history")
+  const estimated = measure(text)
+  if (estimated.tokens > budget) throw contextLengthError(estimated.tokens, budget, "tokens", "history")
+  if (estimated.bytes > byteBudget) throw contextLengthError(estimated.bytes, byteBudget, "bytes", "history")
   const omittedFormatted = omittedIndexes.map((index) => formattedMessage(messages[index]))
   return {
     text,
@@ -488,19 +531,43 @@ function contextPlan(messages, budget = CONTEXT_BUDGET) {
     full,
     estimated,
     budget,
-    fullOverBudget: full.tokens > budget,
+    byteBudget,
+    fullOverBudget: full.tokens > budget || full.bytes > byteBudget,
     omittedCount: omittedIndexes.length,
     omittedTokens: omittedFormatted.reduce((sum, value) => sum + tokenCount(value), 0),
     omittedBytes: omittedFormatted.reduce((sum, value) => sum + utf8Bytes(value), 0),
   }
 }
 
-function initialText(messages, budget = CONTEXT_BUDGET) {
-  return contextPlan(messages, budget).text
+function initialText(messages, budget = CONTEXT_BUDGET, byteBudget = MAX_UPSTREAM_TEXT_BYTES) {
+  return contextPlan(messages, budget, byteBudget).text
 }
 
 function content(value) {
   return [{ type: "text", text: [[value]] }]
+}
+
+const ZERO_UUID = "00000000-0000-4000-8000-000000000000"
+
+function sendEventRequest(account, threadId, userContent, clientEventId = ZERO_UUID) {
+  return {
+    spaceId: account.spaceId,
+    threadId,
+    event: { type: "user.message", content: content(userContent) },
+    surface: "full_page_chat",
+    clientEventId,
+  }
+}
+
+function createThreadRequest(account, chat, effort, text, threadId = ZERO_UUID, clientMessageId = ZERO_UUID) {
+  return {
+    type: "personal_agent", spaceId: account.spaceId, threadId,
+    model: chat.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+    createdSource: "full_page_chat", content: content(text),
+    policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
+    agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
+    browserEnabled: false, clientMessageId,
+  }
 }
 
 function take(key) {
@@ -687,6 +754,12 @@ export default {
     // Preflight the bounded transcript before auth/workspace/catalog access so
     // an oversized latest message cannot consume a cached continuation.
     const plan = contextPlan(chat.messages)
+    const accountShape = { spaceId: ZERO_UUID }
+    // JSON escaping can expand quotes, backslashes and control characters
+    // after the transcript byte window has accepted the raw UTF-8 text. Check
+    // the actual request shapes before auth or a cached continuation is touched.
+    assertUpstreamBodySize("createAgentThread", createThreadRequest(accountShape, chat, chat.reasoning_effort, plan.text))
+    assertUpstreamBodySize("sendEventToAgentThread", sendEventRequest(accountShape, ZERO_UUID, last.content))
     const account = await accountOf(auth, signal)
     const models = await catalog(account, signal)
     const model = models.find((entry) => entry.model === chat.model)
@@ -751,7 +824,7 @@ export default {
           previous = undefined
         } else {
           afterSequence = previous.sequence
-          await json("sendEventToAgentThread", { spaceId: account.spaceId, threadId: previous.threadId, event: { type: "user.message", content: content(last.content) }, surface: "full_page_chat", clientEventId: randomUUID() }, account, signal)
+          await json("sendEventToAgentThread", sendEventRequest(account, previous.threadId, last.content, randomUUID()), account, signal)
           forget(previousEntryKey)
           claimedKey = undefined
         }
@@ -765,14 +838,7 @@ export default {
       threadId = previous.threadId
     } else {
       threadId = randomUUID()
-      const created = await json("createAgentThread", {
-        type: "personal_agent", spaceId: account.spaceId, threadId,
-        model: chat.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}),
-        createdSource: "full_page_chat", content: content(plan.text),
-        policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
-        agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
-        browserEnabled: false, clientMessageId: randomUUID(),
-      }, account, signal)
+      const created = await json("createAgentThread", createThreadRequest(account, chat, effort, plan.text, threadId, randomUUID()), account, signal)
       if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
       threadId = created.threadId
       bounded = plan.fullOverBudget
@@ -824,6 +890,8 @@ export const _internal = {
   estimateTokens,
   tokenCount,
   utf8Bytes,
+  upstreamBodyBytes,
+  assertUpstreamBodySize,
   transcriptText,
   content,
   sessions,
@@ -839,6 +907,8 @@ export const _internal = {
   CONTEXT_BUDGET,
   THREAD_TOKEN_BUDGET,
   TURN_OVERHEAD_TOKENS,
+  MAX_UPSTREAM_TEXT_BYTES,
+  MAX_UPSTREAM_BODY_BYTES,
   MAX_INPUT_BYTES,
   HOST_CONTEXT_GUARD,
   OUTPUT_BUDGET,

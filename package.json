@@ -1,6 +1,6 @@
 {
   "name": "magpie-notion",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Magpie / OpenCode 的 Notion AI 插件：登录时只粘贴自己的 token_v2，工作区自动发现。",
   "type": "module",
   "main": "./index.mjs",
