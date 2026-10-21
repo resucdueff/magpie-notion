@@ -548,17 +548,83 @@ test("a large historical tool result is omitted while the latest user is retaine
   expect(tokens(created)).toBeLessThanOrEqual(40_000)
 })
 
-test("JSON escaping that expands a safe transcript past the body limit fails locally", async () => {
+test("mixed Chinese, quotes, backslashes and control characters that expand past the body limit fail before upstream", async () => {
   const mock = mockNotion()
-  const content = "\n".repeat(120_000)
-  expect(internals.utf8Bytes(content)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_TEXT_BYTES)
-  expect(tokens(content)).toBeLessThan(internals.CONTEXT_BUDGET)
+  const content = "中文数据\"\\\n\r\t".repeat(1_000) + "\"".repeat(10_000) + "\\".repeat(10_000) + "\n".repeat(100_000)
+  const transcript = internals.transcriptText([{ role: "user", content }])
+  expect(internals.utf8Bytes(transcript)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_TEXT_BYTES)
+  expect(tokens(transcript)).toBeLessThanOrEqual(internals.CONTEXT_BUDGET)
+  const requestData = {
+    spaceId: uuid,
+    threadId: "00000000-0000-4000-8000-000000000000",
+    event: { type: "user.message", content: internals.content(content) },
+    surface: "full_page_chat",
+    clientEventId: "00000000-0000-4000-8000-000000000000",
+  }
+  expect(internals.upstreamBodyBytes(requestData)).toBeGreaterThan(internals.MAX_UPSTREAM_BODY_BYTES)
   const response = await request(chat([{ role: "user", content }]))
   expect(response.status).toBe(413)
   const body = await response.json()
   expect(body.error.code).toBe("request_too_large")
   expect(body.error.message).toContain("UTF-8 bytes")
   expect(mock.calls).toHaveLength(0)
+})
+
+test("the create body gate applies only after the request is known to need a new thread", async () => {
+  const mock = mockNotion()
+  const history = [
+    { role: "user", content: "\n".repeat(101_200) },
+    { role: "assistant", content: "Previous answer" + " detail".repeat(Math.ceil(612 / 7)).slice(0, 612) },
+    { role: "user", content: "Next" },
+  ]
+  const plan = internals.contextPlan(history)
+  expect(internals.utf8Bytes(plan.text)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_TEXT_BYTES)
+  const createData = {
+    type: "personal_agent",
+    spaceId: uuid,
+    threadId: "00000000-0000-4000-8000-000000000000",
+    model: model.model,
+    reasoningEffort: "low",
+    createdSource: "full_page_chat",
+    content: internals.content(plan.text),
+    policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
+    agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
+    browserEnabled: false,
+    clientMessageId: "00000000-0000-4000-8000-000000000000",
+  }
+  expect(internals.upstreamBodyBytes(createData)).toBeGreaterThan(internals.MAX_UPSTREAM_BODY_BYTES)
+
+  const response = await request(chat(history))
+  expect(response.status).toBe(413)
+  expect((await response.json()).error.code).toBe("request_too_large")
+  expect(mock.creates).toBe(0)
+  expect(mock.sends).toBe(0)
+})
+
+test("a cached continuation is not rejected by a larger create fallback body", async () => {
+  const mock = mockNotion({ answerSize: 612 })
+  const original = "\n".repeat(101_200)
+  const first = await request(chat([{ role: "user", content: original }]))
+  expect(first.status).toBe(200)
+  const firstBody = await first.json()
+  const created = mock.calls.find((call) => call.name === "createAgentThread")
+  expect(internals.utf8Bytes(created.init.body)).toBeLessThanOrEqual(internals.MAX_UPSTREAM_BODY_BYTES)
+
+  const history = [
+    { role: "user", content: original },
+    firstBody.choices[0].message,
+    { role: "user", content: "Next" },
+  ]
+  const plan = internals.contextPlan(history)
+  const fallback = structuredClone(created.data)
+  fallback.content = internals.content(plan.text)
+  expect(internals.upstreamBodyBytes(fallback)).toBeGreaterThan(internals.MAX_UPSTREAM_BODY_BYTES)
+
+  const response = await request(chat(history))
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toStartWith("Continued answer")
+  expect(mock.creates).toBe(1)
+  expect(mock.sends).toBe(1)
 })
 
 test("an oversized encoded continuation fails before claiming the cached thread", async () => {

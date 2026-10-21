@@ -756,9 +756,9 @@ export default {
     const plan = contextPlan(chat.messages)
     const accountShape = { spaceId: ZERO_UUID }
     // JSON escaping can expand quotes, backslashes and control characters
-    // after the transcript byte window has accepted the raw UTF-8 text. Check
-    // the actual request shapes before auth or a cached continuation is touched.
-    assertUpstreamBodySize("createAgentThread", createThreadRequest(accountShape, chat, chat.reasoning_effort, plan.text))
+    // after the transcript byte window has accepted the raw UTF-8 text. Only
+    // the continuation body is unconditional here: checking the create fallback
+    // would reject a request that can be sent successfully to a cached thread.
     assertUpstreamBodySize("sendEventToAgentThread", sendEventRequest(accountShape, ZERO_UUID, last.content))
     const account = await accountOf(auth, signal)
     const models = await catalog(account, signal)
@@ -838,7 +838,9 @@ export default {
       threadId = previous.threadId
     } else {
       threadId = randomUUID()
-      const created = await json("createAgentThread", createThreadRequest(account, chat, effort, plan.text, threadId, randomUUID()), account, signal)
+      const requestData = createThreadRequest(account, chat, effort, plan.text, threadId, randomUUID())
+      assertUpstreamBodySize("createAgentThread", requestData)
+      const created = await json("createAgentThread", requestData, account, signal)
       if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
       threadId = created.threadId
       bounded = plan.fullOverBudget

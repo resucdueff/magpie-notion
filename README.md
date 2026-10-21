@@ -98,7 +98,9 @@ UTF-8 bytes 除以 4 得到的估算，不是 Notion token 上限，也不参与
 和 256 token 余量），达到 40,000 token 前主动 rollover。线程累计字节不再作为限制，
 因为 Notion 的限制针对每次 POST 的请求体；每次创建或续写都会独立执行最终 JSON
 body 检查。若 transcript 已通过 200,000-byte 门，但 JSON 转义后超过 203,500 bytes，
-插件会在调用 Notion 前返回 `request_too_large`。
+插件会在调用 Notion 前返回 `request_too_large`。续写只检查实际发送的短 user
+message，不会因为假设性的 create fallback 超限而拒绝；create 请求只在确定需要
+新建线程时检查。
 
 system/developer 指令、最新 user，以及两者合在一起超出预算时，错误信息会分别说明
 protected、latest 或 combined，并明确是 token 还是 UTF-8 bytes 超限。请求会在调用
