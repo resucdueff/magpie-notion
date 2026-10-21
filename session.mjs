@@ -12,7 +12,7 @@
 // the caller can fall back to pasting the Cookie header.
 
 import { spawn } from "node:child_process"
-import { createDecipheriv, pbkdf2Sync } from "node:crypto"
+import { createDecipheriv, createHash, pbkdf2Sync } from "node:crypto"
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { delimiter, join, resolve, sep } from "node:path"
@@ -420,7 +420,7 @@ async function readStore(store, options) {
         if (!notionHost(row.host) || !NAMES.includes(row.name)) continue
         let value
         try {
-          value = store.kind === "firefox" ? String(row.value ?? "") : decryptValue(toBuffer(row.encrypted_value), key, options)
+          value = store.kind === "firefox" ? String(row.value ?? "") : decryptValue(toBuffer(row.encrypted_value), key, { ...options, host: row.host })
         } catch (error) {
           // One row this build cannot open - a v20 value beside v10 ones - must
           // not throw away the rows that did open. Only the session itself is
@@ -572,10 +572,15 @@ const SAFE_STORAGE = {
   Edge: { darwin: "Microsoft Edge Safe Storage", linux: "microsoft-edge" },
 }
 
+// keychainSecret reads the cookie key Chromium seals into the login keychain.
+// -s names the service to look for: without it security reads the bare argument
+// as the name of a keychain to search instead, finds no keychain called
+// "Chrome Safe Storage", and answers "item could not be found" - so the key was
+// never read on macOS, and a Full Disk Access grant did not change that.
 async function keychainSecret(store, run) {
   const service = SAFE_STORAGE[store.browser]?.darwin ?? `${store.browser} Safe Storage`
   try {
-    return (await run("/usr/bin/security", ["find-generic-password", "-w", service])).trim()
+    return (await run("/usr/bin/security", ["find-generic-password", "-w", "-s", service])).trim()
   } catch {
     return ""
   }
@@ -590,6 +595,28 @@ async function secretServiceKey(store, run) {
   }
 }
 
+// Chrome 130 (cookie schema version 24) seals the cookie's domain into the
+// value itself: the plaintext carries the SHA-256 of the domain in front of the
+// value, so a value copied into another domain's store no longer opens. The
+// digest is 32 bytes of binary, not text, so a value read without dropping it
+// carries bytes a request header may not hold - and a session that was read
+// perfectly well is then refused as an invalid Cookie header, which is how a
+// sign-in that succeeded still cannot fetch a single model.
+const DOMAIN_HASH_BYTES = 32
+
+// withoutDomainHash drops that digest, and only ever drops it when it is the
+// hash of the domain this cookie was filed under - the host_key column, hashed
+// as it is written there and not in any tidied-up form. That is what makes
+// dropping it safe rather than a guess: a store written before Chrome 130
+// carries no digest and keeps its value whole, and a value that names another
+// domain is left as it was, the way the browser itself refuses it, instead of
+// being shortened into a value that only looks like a session.
+function withoutDomainHash(plain, host) {
+  if (!host || plain.length <= DOMAIN_HASH_BYTES) return plain
+  const digest = createHash("sha256").update(host).digest()
+  return plain.subarray(0, DOMAIN_HASH_BYTES).equals(digest) ? plain.subarray(DOMAIN_HASH_BYTES) : plain
+}
+
 // decryptValue opens one Chromium cookie value: "v10"/"v11" as Windows and the
 // desktops write them, a bare DPAPI blob as Chrome wrote before v80, and
 // nothing at all for the v20 app-bound values Chrome and Edge write now.
@@ -602,12 +629,16 @@ export function decryptValue(value, secret, options = {}) {
   }
   if (!secret) throw new SessionError("the store's cookie key is missing", "unsupported-encryption")
   if (prefix === "v10" || prefix === "v11") {
-    if (platform === "win32" || secret.cipher === "gcm") return gcm(value.subarray(3), secret.key)
-    try {
-      return cbc(value.subarray(3), secret.key)
-    } catch (error) {
-      throw secret.fallbackError ?? error
+    let plain
+    if (platform === "win32" || secret.cipher === "gcm") plain = gcm(value.subarray(3), secret.key)
+    else {
+      try {
+        plain = cbc(value.subarray(3), secret.key)
+      } catch (error) {
+        throw secret.fallbackError ?? error
+      }
     }
+    return withoutDomainHash(plain, options.host).toString("utf8")
   }
   // Chrome before v80 sealed each value with DPAPI on its own. Those builds
   // are years old; a value that is not marked with a version is reported, not
@@ -623,7 +654,7 @@ function gcm(payload, key) {
   try {
     const decipher = createDecipheriv("aes-256-gcm", key, nonce)
     decipher.setAuthTag(tag)
-    return Buffer.concat([decipher.update(body), decipher.final()]).toString("utf8")
+    return Buffer.concat([decipher.update(body), decipher.final()])
   } catch {
     throw new SessionError("the cookie value could not be unsealed", "unsupported-encryption")
   }
@@ -632,7 +663,7 @@ function gcm(payload, key) {
 function cbc(payload, key) {
   try {
     const decipher = createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, " "))
-    return Buffer.concat([decipher.update(payload), decipher.final()]).toString("utf8")
+    return Buffer.concat([decipher.update(payload), decipher.final()])
   } catch {
     throw new SessionError("the cookie value could not be unsealed", "unsupported-encryption")
   }
