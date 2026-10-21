@@ -1,6 +1,6 @@
 # magpie-notion
 
-版本：1.0.5
+版本：1.0.6
 
 `magpie-notion` 是一个把 Notion AI 接入 Magpie / OpenCode 的非官方插件。它使用
 Notion 网页客户端所调用的内部接口，不是 Notion 的公开 Integration API；Notion
@@ -74,27 +74,39 @@ Magpie 添加插件时会安装运行依赖。运行时 provider id 仍是 `noti
 
 ## 长上下文
 
-插件内部使用 **40,000 token** 的保守安全窗口。它使用随依赖安装的纯 JavaScript
-`gpt-tokenizer`（`cl100k_base` 词表）在本地计算 token，不调用网络 API，也不会在
-运行时下载词表。这只是适配器的安全阈值，不是 Notion 官方公布的限制；Notion 的私有
-tokenizer 与 `cl100k_base` 可能有差异，因此 40K 比实测约 51K 的边界低约 11K，而不是
-把 40K 当成官方上限。
+插件用两组本地门共同判断能否发送：
 
-为了避开 Magpie / OpenCode 与 `cl100k_base` 不一致的 token 估算，模型目录会显式
-发布 `limit.context = 2,097,152`。这个值是 2 MiB 传输上限对应的**宿主守卫值**，
-不是 Notion 或任何 AI 模型的真实上下文窗口，也不代表模型能处理 200 万 token。
-它让宿主不会在插件之前误拒插件本来接受的请求，同时保留 `limit.output = 8192`，
-并阻止 models.dev 用与 Notion 无关的窗口回填。请求能否进入 Notion 仍由插件的
-**40,000 token `cl100k_base` 安全窗口**、`sentTokens` rollover 和 2 MiB 传输限制
-决定；真正超过 40K 时会在调用 Notion 前明确返回 `context_length_exceeded`。
+1. **40,000 token**：随依赖安装的纯 JavaScript `gpt-tokenizer` 使用
+   `cl100k_base` 词表计算，不调用网络 API。这是适配器对 Notion 私有 tokenizer
+   的保守近似，不是 Notion 官方公布的限制。
+2. **200,000 UTF-8 bytes**：完整 transcript 的保守字节窗口。发送前还会对实际
+   `JSON.stringify(requestData)` 做最终检查，上限为 **203,500 UTF-8 bytes**，
+   覆盖 JSON 引号、反斜杠、换行等转义膨胀。
 
-历史较长时，插件会完整保留 system/developer 指令和最新一条 user 消息，从新到旧
-整条装入近期消息，省略标记本身也计入 token 预算。完整历史首次超过窗口后会改用有界
-近期历史新建线程，后续轮次优先续写该线程；每个远端线程累计
-`initialPlan.tokens + user/assistant tokens + 256 token 余量`，到 40,000 token 前
-主动重新生成有界上下文并 rollover，不先发送一个已知超限的请求。另设 2 MB UTF-8
-输入上限，只用于防止异常大请求消耗资源，不作为正常上下文判断。
+实测中，Notion 的 `createAgentThread` 在请求体约 **204.2 KB** 附近出现内部边界：
+约 204,200 bytes 曾返回 HTTP 200，约 204,250 bytes 曾返回 HTTP 400。该数字是实测
+观察值，**不是 Notion 官方承诺或公开限制**。因此本插件不贴着 204,000 bytes 使用，
+而是保留约 4 KB 的 transcript/JSON 余量。早先出现的“51,059 tokens”只是旧实现用
+UTF-8 bytes 除以 4 得到的估算，不是 Notion token 上限，也不参与当前放行判断。
 
-system/developer 指令单独超过 token 上限、最新 user 单独超过 token 上限，或两者
-分别未超限但合在一起超限时，请求都会在调用 Notion 前返回
-`context_length_exceeded`，错误信息会分别说明原因；请缩短对应内容或新开会话。
+历史较长时，插件会始终保留全部 system/developer 指令和最新一条 user 消息，再从新
+到旧整条加入历史；省略标记本身同时计入 token 与 bytes 预算。任何一条消息加入后
+使任一维度超限，就停在该条之前，不会拆分或截断消息。完整历史超过任一窗口后，插件
+会用有界近期历史新建线程，后续轮次优先续写该线程。
+
+每个远端线程只累计 `sentTokens`（初始 transcript token、后续 user/assistant token
+和 256 token 余量），达到 40,000 token 前主动 rollover。线程累计字节不再作为限制，
+因为 Notion 的限制针对每次 POST 的请求体；每次创建或续写都会独立执行最终 JSON
+body 检查。若 transcript 已通过 200,000-byte 门，但 JSON 转义后超过 203,500 bytes，
+插件会在调用 Notion 前返回 `request_too_large`。续写只检查实际发送的短 user
+message，不会因为假设性的 create fallback 超限而拒绝；create 请求只在确定需要
+新建线程时检查。
+
+system/developer 指令、最新 user，以及两者合在一起超出预算时，错误信息会分别说明
+protected、latest 或 combined，并明确是 token 还是 UTF-8 bytes 超限。请求会在调用
+Notion 前返回 `context_length_exceeded`，缓存中的续写线程不会被消费。
+
+模型目录发布的 `limit.context = 2,097,152` 只是为 Magpie / OpenCode 设置的
+**宿主元数据守卫值**，用来避免宿主先于插件误拒请求。它不代表 Notion 能处理 2 MiB
+上下文，也不代表模型有 200 万 token 窗口。另设的 2 MiB 输入上限只用于对异常大
+请求返回 413，防止本地资源耗尽，不参与正常上下文选择。
