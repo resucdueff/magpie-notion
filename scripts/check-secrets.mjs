@@ -2,23 +2,15 @@
 // The check tests shapes, not values: fixtures and tests use short obvious
 // placeholders, while a real token is long enough to be recognised here.
 import { readFileSync, readdirSync } from "node:fs"
-import { join, relative } from "node:path"
-import { fileURLToPath } from "node:url"
+import { join, relative, resolve } from "node:path"
+import { fileURLToPath, pathToFileURL } from "node:url"
+import { hasSecretShape } from "./secret-patterns.mjs"
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
-const PATTERNS = [
-  /token_v2=[A-Za-z0-9_%:.-]{20,}/,
-  /\bv0\d(?::|%3A)[A-Za-z0-9_%.:-]{16,}/,
-  /\bsecret_[A-Za-z0-9]{24,}/,
-  /\bntn_[A-Za-z0-9]{24,}/,
-  /\bsk-[A-Za-z0-9]{24,}/,
-]
 const IGNORE = new Set([".git", "node_modules", "dist", "coverage"])
 const MAX_BYTES = 2 * 1024 * 1024
 
-export function hasSecretShape(value) {
-  return PATTERNS.some((pattern) => pattern.test(value))
-}
+export { hasSecretShape }
 
 function* files(directory) {
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -29,24 +21,37 @@ function* files(directory) {
   }
 }
 
-const hits = []
-for (const path of files(ROOT)) {
-  let content
-  try {
-    if (readFileSync(path).length > MAX_BYTES) continue
-    content = readFileSync(path, "utf8")
-  } catch {
-    continue
+export function findCommittedSecretHits(root = ROOT) {
+  const hits = []
+  for (const path of files(root)) {
+    let content
+    try {
+      if (readFileSync(path).length > MAX_BYTES) continue
+      content = readFileSync(path, "utf8")
+    } catch {
+      continue
+    }
+    if (content.includes("\u0000")) continue
+    const lines = content.split(/\r?\n/)
+    lines.forEach((line, index) => {
+      if (hasSecretShape(line)) hits.push(`${relative(root, path)}:${index + 1}`)
+    })
   }
-  if (content.includes("\u0000")) continue
-  const lines = content.split(/\r?\n/)
-  lines.forEach((line, index) => {
-    if (hasSecretShape(line)) hits.push(`${relative(ROOT, path)}:${index + 1}`)
-  })
+  return hits
 }
 
-if (hits.length) {
-  console.error(`possible committed secrets:\n  ${hits.join("\n  ")}`)
-  process.exit(1)
+export function isCliEntry(metaUrl = import.meta.url, argv1 = process.argv[1]) {
+  if (!argv1) return false
+  return metaUrl === pathToFileURL(resolve(argv1)).href
 }
-console.log("no committed Notion session or API token shapes found")
+
+function main() {
+  const hits = findCommittedSecretHits()
+  if (hits.length) {
+    console.error(`possible committed secrets:\n  ${hits.join("\n  ")}`)
+    process.exit(1)
+  }
+  console.log("no committed Notion session or API token shapes found")
+}
+
+if (isCliEntry()) main()

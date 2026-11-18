@@ -289,6 +289,40 @@ test("a completed backward page is joined with the earlier answer page", async (
   expect(mock.calls.filter((call) => call.name === "listenToThreadTranscript")).toHaveLength(0)
 })
 
+test("an incomplete new thread does not page backward just because a cursor is present", async () => {
+  let pages = 0
+  const mock = mockNotion({ handle: (name) => {
+    if (name === "getThreadTranscript") {
+      pages++
+      return Response.json(page([], 0, "running", { backward_cursor: "older-page", has_more_backward: true }))
+    }
+  } })
+  const response = await request(chat())
+  expect(response.status).toBe(200)
+  expect((await response.json()).choices[0].message.content).toBe("First answer")
+  expect(pages).toBe(1)
+  expect(mock.calls.filter((call) => call.name === "listenToThreadTranscript")).toHaveLength(1)
+})
+
+test("paging stops with a clear error when the backward limit is hit before the previous turn", async () => {
+  // Mock pages use the same field names as the web client's getThreadTranscript
+  // page (backward_cursor, has_more_backward). This is not a live Notion test.
+  const mock = mockNotion({ handle: (name, data) => {
+    if (name !== "getThreadTranscript") return
+    const cursor = data.cursor
+    const index = typeof cursor === "string" && cursor.startsWith("b") ? Number(cursor.slice(1)) : 1
+    const patches = index === 1
+      ? [done(100)]
+      : [{ op: "put", entity: { id: "status-" + index, kind: "status", sequence: 100 - index } }]
+    return Response.json(page(patches, 100, "idle", { backward_cursor: "b" + (index + 1), has_more_backward: true }))
+  } })
+  const response = await request(chat())
+  expect(response.status).toBe(502)
+  expect((await response.json()).error.code).toBe("transcript_too_long")
+  expect(mock.calls.filter((call) => call.name === "getThreadTranscript")).toHaveLength(1 + internals.MAX_BACKWARD_PAGES)
+  expect(mock.calls.filter((call) => call.name === "listenToThreadTranscript")).toHaveLength(0)
+})
+
 test.each([[401, "session_expired"], [403, "workspace_forbidden"], [429, "rate_limited"], [402, "upstream_http_error"]])("HTTP %i is preserved with %s and no upstream secrets", async (status, code) => {
   mockNotion({ handle: () => new Response("upstream-private-account-data", { status }) })
   const response = await request(chat())
@@ -585,14 +619,60 @@ test("a committed answer shorter than the provisional text is not a failure", as
   const response = await request(chat())
   expect(response.status).toBe(200)
   const first = await response.json()
-  // Text already sent cannot be taken back, so this is also the text cached for
-  // the next turn.
-  expect(first.choices[0].message.content).toBe(provisional)
+  // Non-streaming clients never saw the provisional text, so the committed
+  // answer is both the response and the continuation cache key.
+  expect(first.choices[0].message.content).toBe("Hello")
+  const record = [...internals.sessions.values()][0]
+  const base = internals.contextPlan(chat().messages).estimated.tokens + internals.TURN_OVERHEAD_TOKENS
+  expect(record.sentTokens).toBe(base + internals.tokenCount("Hello"))
   const history = [...chat().messages, first.choices[0].message, { role: "user", content: "Second" }]
   const second = await (await request(chat(history))).json()
   expect(second.choices[0].message.content).toBe("Second answer")
   expect(mock.creates).toBe(1)
   expect(mock.sends).toBe(1)
+})
+
+test("a streaming turn caches the text already sent, not the shorter committed answer", async () => {
+  const provisional = "Hello world, this is the provisional stream"
+  const mock = mockNotion({ handle: (name, data, calls) => {
+    if (name === "getThreadTranscript" && calls.filter((v) => v.name === "getThreadTranscript").length === 2) return Response.json(page([], 2, "idle"))
+    if (name === "listenToThreadTranscript" && !calls.some((v) => v.name === "sendEventToAgentThread")) return ndjson([
+      frame(message(provisional, 1, "provisional")),
+      frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+    ])
+  } })
+  const response = await request(chat(undefined, { stream: true }))
+  expect(response.status).toBe(200)
+  expect(await response.text()).toContain(provisional)
+  const record = [...internals.sessions.values()][0]
+  const base = internals.contextPlan(chat().messages).estimated.tokens + internals.TURN_OVERHEAD_TOKENS
+  expect(record.sentTokens).toBe(base + internals.tokenCount(provisional))
+  const continued = await request(chat([
+    ...chat().messages,
+    { role: "assistant", content: provisional },
+    { role: "user", content: "Second" },
+  ]))
+  expect(continued.status).toBe(200)
+  expect((await continued.json()).choices[0].message.content).toBe("Second answer")
+  expect(mock.creates).toBe(1)
+  expect(mock.sends).toBe(1)
+})
+
+test("a streaming turn is not continued from the shorter committed answer", async () => {
+  const provisional = "Hello world, this is the provisional stream"
+  const mock = mockNotion({ handle: (name) => name === "listenToThreadTranscript" ? ndjson([
+    frame(message(provisional, 1, "provisional")),
+    frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
+  ]) : undefined })
+  expect((await request(chat(undefined, { stream: true }))).status).toBe(200)
+  const missed = await request(chat([
+    ...chat().messages,
+    { role: "assistant", content: "Hello" },
+    { role: "user", content: "Second" },
+  ]))
+  expect(missed.status).toBe(200)
+  expect(mock.creates).toBe(2)
+  expect(mock.sends).toBe(0)
 })
 
 test("a shorter committed answer keeps the stream that was already sent intact", async () => {
@@ -608,13 +688,14 @@ test("a shorter committed answer keeps the stream that was already sent intact",
   expect(text).toContain("[DONE]")
 })
 
-test("done text is exactly the assistant text already yielded to the client", async () => {
+test("done events keep the committed text and the already streamed text separate", async () => {
   const events = await collect(transcriptEvents(iterable([
     frame(message("Hello world, this is the provisional stream", 1, "provisional")),
     frame({ op: "remove", id: "provisional" }, message("Hello", 1, "committed"), done(2)),
   ])))
   const streamed = events.filter((event) => event.type === "text").map((event) => event.text).join("")
-  expect(events.at(-1)).toMatchObject({ type: "done", text: streamed })
+  expect(streamed).toBe("Hello world, this is the provisional stream")
+  expect(events.at(-1)).toMatchObject({ type: "done", text: "Hello", streamed })
 })
 
 test("a turn that ends without text is reported, not answered with nothing", async () => {
