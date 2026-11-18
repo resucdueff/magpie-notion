@@ -177,10 +177,11 @@ export async function* transcriptEvents(frames, signal, { afterSequence = 0 } = 
         throw new ProviderError(502, "unsupported_stop_reason", "Notion AI ended with an unverified stop reason.")
       }
       if (!visible) throw new ProviderError(502, "empty_answer", "Notion AI completed the turn without any text to send.")
-      // Streaming text cannot be taken back. Report exactly what was yielded,
-      // so buffered clients, streaming clients and the next-turn cache all see
-      // the same assistant message.
-      yield { type: "done", finishReason: "stop", sequence: completed.sequence, text: emitted }
+      // `text` is the committed answer. `streamed` is the text already yielded
+      // to a live client, which may be longer when a provisional message was
+      // later shortened. Buffered and streaming callers pick the value that
+      // matches what they actually returned.
+      yield { type: "done", finishReason: "stop", sequence: completed.sequence, text: visible, streamed: emitted }
       return
     }
   }

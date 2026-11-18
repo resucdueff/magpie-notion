@@ -695,19 +695,37 @@ function crossedBoundary(page, afterSequence) {
   })
 }
 
+function turnCompletedOn(page, afterSequence) {
+  return page.patches.some((patch) => patch.op === "put" && patch.entity?.kind === "turn_completed" && patch.entity.sequence > afterSequence)
+}
+
+function remainingBackwardCursor(page, seen) {
+  const cursor = page.backward_cursor
+  if (typeof cursor !== "string" || !cursor || page.has_more_backward === false || seen.has(cursor)) return undefined
+  return cursor
+}
+
 async function transcriptPages(account, threadId, afterSequence, signal) {
   const latest = transcriptPage(await json("getThreadTranscript", { spaceId: account.spaceId, threadId, direction: "backward", limit: 10 }, account, signal))
   if (crossedBoundary(latest, afterSequence)) return [latest]
+  // Live turns are read from the forward cursor. Paging backward is only
+  // needed when this page already contains the completion, so earlier patches
+  // of the same turn might sit on older pages. A new thread (afterSequence 0)
+  // therefore does not walk history just because a backward cursor is present.
+  if (!turnCompletedOn(latest, afterSequence)) return [latest]
   const pages = [latest]
   const seen = new Set()
   let page = latest
   for (let count = 0; count < MAX_BACKWARD_PAGES; count++) {
-    const cursor = page.backward_cursor
-    if (typeof cursor !== "string" || !cursor || page.has_more_backward === false || seen.has(cursor)) break
+    const cursor = remainingBackwardCursor(page, seen)
+    if (!cursor) return pages
     seen.add(cursor)
     page = transcriptPage(await json("getThreadTranscript", { spaceId: account.spaceId, threadId, direction: "backward", cursor, limit: 10 }, account, signal))
     pages.unshift(page)
-    if (crossedBoundary(page, afterSequence)) break
+    if (crossedBoundary(page, afterSequence)) return pages
+  }
+  if (remainingBackwardCursor(page, seen)) {
+    throw new ProviderError(502, "transcript_too_long", "The Notion transcript is longer than the adapter will page through. Open the thread in Notion, or start a new conversation.")
   }
   return pages
 }
@@ -850,7 +868,7 @@ export default {
     const newest = pages.at(-1)
     const page = pages.length === 1 ? newest : { ...newest, patches: pages.flatMap((entry) => entry.patches) }
     if (afterSequence === 0 || page.session?.sequence > afterSequence || page.session?.last_turn_allowance?.sequence > afterSequence) sessionError(page.session)
-    const completedOnPage = page.patches.some((patch) => patch.op === "put" && patch.entity?.kind === "turn_completed" && patch.entity.sequence > afterSequence)
+    const completedOnPage = turnCompletedOn(page, afterSequence)
     let liveResponse
     if (!completedOnPage) {
       if (typeof page.forward_cursor !== "string") throw new ProviderError(502, "missing_cursor", "Notion AI did not return a transcript cursor.")
@@ -868,8 +886,13 @@ export default {
         for await (const event of transcriptEvents(frames(), signal, { afterSequence })) {
           if (event.type === "text") answer += event.text
           else if (event.type === "done") {
-            const completedTokens = sentTokens + tokenCount(answer)
-            remember(historyKey([...chat.messages, { role: "assistant", content: answer }]), threadId, event.sequence, bounded, completedTokens)
+            // Streamed text cannot be taken back; a buffered client receives the
+            // committed `text`. Cache and sentTokens must follow the same value.
+            const cachedText = chat.stream
+              ? (typeof event.streamed === "string" ? event.streamed : answer)
+              : (typeof event.text === "string" ? event.text : answer)
+            const completedTokens = sentTokens + tokenCount(cachedText)
+            remember(historyKey([...chat.messages, { role: "assistant", content: cachedText }]), threadId, event.sequence, bounded, completedTokens)
           }
           yield event
         }
@@ -906,6 +929,7 @@ export const _internal = {
   billingWindow,
   quotaWindows,
   useFetch,
+  MAX_BACKWARD_PAGES,
   CONTEXT_BUDGET,
   THREAD_TOKEN_BUDGET,
   TURN_OVERHEAD_TOKENS,
